@@ -2,6 +2,7 @@ import csv
 import json
 import math
 import os
+import tempfile
 import xml.etree.ElementTree as ET
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -25,12 +26,79 @@ def _real_geo():
 
 
 def _window_with_path():
+    import numpy as np
+    from model import INFERENCE_PIPELINE_VERSION
+    from path_planner import PATH_PLANNING_VERSION
+    from provenance import file_sha256, make_stage_record
+    from row_geometry import MASK_REGULARIZATION_VERSION
+
     QApplication.instance() or QApplication([])
     window = MainWindow()
     window.geo, _affine, _transformer = _real_geo()
+    model_path = os.path.join(tempfile.gettempdir(), "reui-integrity-test-model.pt")
+    with open(model_path, "wb") as handle:
+        handle.write(b"test-model")
+    model_sha256 = file_sha256(model_path)
+    raw_mask = np.ones((40, 40), dtype=np.uint8)
+    processed_mask = raw_mask.copy()
+    inference_inputs = {
+        "source_sha256": "test-source-sha256",
+        "model_sha256": model_sha256,
+        "inference_config": {
+            "capture_size": int(window.cfg.TILE_CAPTURE_SIZE),
+            "overlap": float(window.cfg.TILE_OVERLAP),
+            "conf": float(window.cfg.MODEL_CONF),
+            "iou": float(window.cfg.MODEL_IOU),
+            "batch_size": 4,
+        },
+        "preprocessing_config": window.cfg.section("raster_preprocessing"),
+    }
+    inference_record = make_stage_record(
+        "inference", INFERENCE_PIPELINE_VERSION, inference_inputs, raw_mask
+    )
+    mask_inputs = {
+        "inference_fingerprint": inference_record["fingerprint"],
+        "raw_mask_sha256": inference_record["artifact_sha256"],
+        "mask_config": window.cfg.section("mask_processing"),
+    }
+    mask_record = make_stage_record(
+        "mask", MASK_REGULARIZATION_VERSION, mask_inputs, processed_mask
+    )
+    path_geometry = [[(10.25, 20.75), (15.5, 25.125)]]
+    harvester = window._effective_harvester_params(window.state.harvester_params)
+    path_config = window.cfg.section("path_planning")
+    path_config.update({
+        "min_turn_radius_m": float(harvester["turn_radius_m"]),
+        "turn_strategy": str(window.state.turn_strategy),
+    })
+    path_inputs = {
+        "mask_fingerprint": mask_record["fingerprint"],
+        "path_config": path_config,
+        "harvester": harvester,
+        "turn_strategy": str(window.state.turn_strategy),
+        "entry_point": window.state.entry_point,
+        "exit_point": window.state.exit_point,
+        "unload_points": list(window.state.unload_points),
+    }
+    path_record = make_stage_record(
+        "path",
+        PATH_PLANNING_VERSION,
+        path_inputs,
+        {"full_path": path_geometry, "segment_types": ["work"]},
+    )
+    window.state.safe_update(
+        source_sha256="test-source-sha256",
+        current_model_path=model_path,
+        model_sha256=model_sha256,
+        mask_raw=raw_mask,
+        inference_provenance=inference_record,
+        mask_result={"processed_mask": processed_mask, "provenance": mask_record},
+        mask_provenance=mask_record,
+        path_provenance=path_record,
+    )
     window._pipeline_result = {
         "path": {
-            "full_path": [[(10.25, 20.75), (15.5, 25.125)]],
+            "full_path": path_geometry,
             "segment_types": ["work"],
             "geo_points": [
                 {
@@ -53,6 +121,7 @@ def _window_with_path():
                 },
             ],
             "validation": {"valid": True},
+            "provenance": path_record,
         }
     }
     return window
@@ -211,6 +280,23 @@ def test_export_payload_recomputes_stale_coordinates_from_display_path():
     ]
 
 
+def test_export_rejects_service_point_change_after_path_planning():
+    window = _window_with_path()
+    window.state.entry_point = (5.0, 5.0)
+
+    with pytest.raises(ValueError, match="input fingerprint"):
+        window._geo_export_payload()
+
+
+def test_export_rejects_model_content_change_after_inference():
+    window = _window_with_path()
+    with open(window.state.current_model_path, "wb") as handle:
+        handle.write(b"changed-model")
+
+    with pytest.raises(ValueError, match="input fingerprint"):
+        window._geo_export_payload()
+
+
 def test_export_blocks_path_points_outside_loaded_image():
     import numpy as np
 
@@ -310,7 +396,7 @@ def test_project_cache_is_rejected_when_source_file_changes(tmp_path, monkeypatc
     assert cache.load_project_state(str(source)) == {}
 
 
-def test_legacy_export_engine_uses_validated_atomic_path_export(tmp_path):
+def test_legacy_export_engine_is_disabled_to_prevent_bypassing_export_gate(tmp_path):
     from export import ExportEngine
     from state import AppState
 
@@ -319,9 +405,6 @@ def test_legacy_export_engine_uses_validated_atomic_path_export(tmp_path):
     state.path_status = [0]
     output = tmp_path / "legacy.path"
 
-    ExportEngine(_real_geo()[0], state).export_to_file(str(output))
-
-    rows = output.read_text(encoding="utf-8").splitlines()
-    assert len([row for row in rows if row.startswith("$PATH")]) == 2
-    assert rows[0].endswith(",0*")
-    assert rows[1].endswith(",0*")
+    with pytest.raises(RuntimeError, match="已禁用"):
+        ExportEngine(_real_geo()[0], state).export_to_file(str(output))
+    assert not output.exists()

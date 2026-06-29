@@ -44,7 +44,7 @@ class MainWindow(QMainWindow):
         self.apply_stylesheet()
         self.cfg = Config(); self.cfg.load()
         self.state = AppState(); self.geo = GeoUtils()
-        self._mask_processing_strength = str(self.cfg._raw.get("mask_processing", {}).get("strength", "standard"))
+        self._mask_processing_strength = str(self.cfg.section("mask_processing").get("strength", "standard"))
         # 从 config.json 加载农机参数；缺项使用 Config 默认值补齐，避免默认参数被判定“不完整”。
         self.state.harvester_params = self._effective_harvester_params({})
         self.model_engine = ModelEngine()
@@ -109,7 +109,7 @@ class MainWindow(QMainWindow):
             "track_length_m": float(self.cfg.TRACK_LENGTH_M),
             "turn_radius_m": float(self.cfg.TURN_RADIUS_M),
         }
-        for source in (self.cfg._raw.get("harvester", {}) or {}, override or {}):
+        for source in (self.cfg.section("harvester"), override or {}):
             if not isinstance(source, dict):
                 continue
             for key in params:
@@ -515,15 +515,38 @@ class MainWindow(QMainWindow):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(root, "data", "models")
 
+    def _model_registry(self, model_dir=None):
+        registry_path = os.path.join(
+            model_dir or self._builtin_model_dir(), "model_registry.json"
+        )
+        try:
+            with open(registry_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return {
+                str(item.get("name", "")): dict(item)
+                for item in payload.get("models", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _model_registry_entry(self, model_path):
+        if not model_path:
+            return {}
+        return self._model_registry().get(os.path.basename(str(model_path)), {})
+
     def _builtin_model_list(self, model_dir=None):
         model_dir = model_dir or self._builtin_model_dir()
-        names = [
-            "yolo11m_seg_best.pt",
-            "yolo11s_seg_best.pt",
-            "yolov8s_seg_best.pt",
+        registry = self._model_registry(model_dir)
+        names = list(registry) or [
+            "yolo11m_seg_best.pt", "yolo11s_seg_best.pt", "yolov8s_seg_best.pt"
         ]
         return [
-            {"name": name, "path": os.path.join(model_dir, name)}
+            {
+                "name": name,
+                "path": os.path.join(model_dir, name),
+                "sha256": str(registry.get(name, {}).get("sha256", "")),
+            }
             for name in names
             if os.path.isfile(os.path.join(model_dir, name))
         ]
@@ -637,13 +660,21 @@ class MainWindow(QMainWindow):
             self._tif_path = path
             from cache import source_identity
             self._tif_source_identity = source_identity(path)
-            self.state.tif_path = path
-            self.state.source_img_h, self.state.source_img_w = full_h, full_w
-            self.state.img_h, self.state.img_w = out_h, out_w
-            self.state.display_h, self.state.display_w = out_h, out_w
-            self.state.downsample_factor = downsample
-            self.state.display_scale_x = float(full_w) / float(out_w)
-            self.state.display_scale_y = float(full_h) / float(out_h)
+            self.state.safe_update(
+                tif_path=path,
+                source_img_h=full_h,
+                source_img_w=full_w,
+                img_h=out_h,
+                img_w=out_w,
+                display_h=out_h,
+                display_w=out_w,
+                downsample_factor=downsample,
+                display_scale_x=float(full_w) / float(out_w),
+                display_scale_y=float(full_h) / float(out_h),
+                source_sha256=str(result.get("source_sha256", "") or ""),
+                source_metadata=dict(result.get("source_metadata") or {}),
+                raster_preprocessing=dict(result.get("preview_preprocessing") or {}),
+            )
             self.top_toolbar.set_filename(path)
             self.image_view.set_image(rgb)
             try:
@@ -669,7 +700,10 @@ class MainWindow(QMainWindow):
                 self._worker_thread.quit()
 
     def _start_cache_restore(self, path):
-        worker = CacheRestoreWorker(path)
+        worker = CacheRestoreWorker(
+            path,
+            expected_source_sha256=str(getattr(self.state, "source_sha256", "") or ""),
+        )
         worker.finished.connect(self._on_cache_restore_done)
         if not self._start_background_worker(worker, "正在后台恢复项目缓存..."):
             self._log.info("cache restore skipped: background worker busy")
@@ -704,6 +738,9 @@ class MainWindow(QMainWindow):
                     'auto_path_valid', 'auto_path_desc', 'auto_path_geo',
                     'path_points', 'path_status', 'simulation_done', 'export_done',
                     'turn_strategy', 'current_model_name', 'current_model_path',
+                    'source_sha256', 'source_metadata', 'raster_preprocessing',
+                    'model_sha256', 'inference_provenance', 'mask_provenance',
+                    'path_provenance', 'inference_runtime', 'path_runtime',
                     'last_total_path_m', 'last_work_path_m', 'last_turn_path_m',
                     'last_entry_exit_path_m', 'last_harvest_rate',
                     'last_planned_harvest_rate', 'last_detected_harvest_rate',
@@ -715,6 +752,8 @@ class MainWindow(QMainWindow):
             )
             self.state.safe_update(**restored_state)
             self.log_panel.info("已恢复最近项目；任务状态将按实际缓存内容同步")
+            for message in payload.get("cache_validation_messages", []) or []:
+                self.log_panel.warn(str(message))
 
             self._service_points_visible = bool(saved.get('auto_path_planned') and processed_cache_valid)
 
@@ -818,7 +857,7 @@ class MainWindow(QMainWindow):
         return raw_name or base or path
 
     def _custom_model_list(self):
-        items = self.cfg._raw.get("models", {}).get("custom", [])
+        items = self.cfg.section("models").get("custom", [])
         clean = []
         seen = set()
         for item in items if isinstance(items, list) else []:
@@ -839,9 +878,9 @@ class MainWindow(QMainWindow):
                 continue
             seen.add(path)
             custom.append({"name": model.get("name") or self._model_display_name(model), "path": path})
-        self.cfg._raw.setdefault("models", {})["custom"] = custom
+        config_snapshot = self.cfg.update_section("models", {"custom": custom})
         cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
-        save_json_atomic(cfg_path, self.cfg._raw)
+        save_json_atomic(cfg_path, config_snapshot)
 
     def _on_model_combo_changed(self, model_path_or_name):
         if model_path_or_name == "__IMPORT_MODEL_FOLDER__" or model_path_or_name == "导入模型文件夹...":
@@ -932,6 +971,14 @@ class MainWindow(QMainWindow):
             return False
         try:
             previous_path = str(getattr(self.state, 'current_model_path', '') or '')
+            previous_sha256 = str(getattr(self.state, 'model_sha256', '') or '')
+            from provenance import file_sha256
+            model_sha256 = file_sha256(path)
+            registry_entry = self._model_registry_entry(path) if not external_model else {}
+            expected_sha256 = str(registry_entry.get("sha256", "") or "").lower()
+            if expected_sha256 and model_sha256.lower() != expected_sha256:
+                self.log_panel.error("内置模型哈希与注册表不一致，已拒绝加载")
+                return False
             if not self.model_engine.load(path):
                 self.log_panel.error("模型加载失败")
                 return False
@@ -943,7 +990,11 @@ class MainWindow(QMainWindow):
             self.task_panel.set_model_path(name)
             self.state.current_model_name = name
             self.state.current_model_path = path
-            if previous_path and os.path.abspath(previous_path) != os.path.abspath(path):
+            self.state.model_sha256 = model_sha256
+            if previous_path and (
+                os.path.abspath(previous_path) != os.path.abspath(path)
+                or (previous_sha256 and previous_sha256 != model_sha256)
+            ):
                 self._invalidate_analysis_from(
                     "inference",
                     "识别模型已变化，旧识别掩膜和路径不能继续使用",
@@ -1153,12 +1204,20 @@ class MainWindow(QMainWindow):
                 mask_raw=None,
                 inference_original_mask=None,
                 inference_done=False,
+                inference_provenance={},
+                inference_runtime={},
+                mask_provenance={},
+                path_provenance={},
+                path_runtime={},
                 workflow_step=0,
             )
         if stage in {"inference", "mask"}:
             updates.update(
                 mask_processed=False,
                 mask_result=None,
+                mask_provenance={},
+                path_provenance={},
+                path_runtime={},
                 entry_point=None,
                 exit_point=None,
                 unload_points=[],
@@ -1177,6 +1236,8 @@ class MainWindow(QMainWindow):
             auto_path_planned=False,
             auto_path_valid=False,
             auto_path_desc="",
+            path_provenance={},
+            path_runtime={},
             path_points=[],
             path_status=[],
             simulation_done=False,
@@ -1211,9 +1272,9 @@ class MainWindow(QMainWindow):
             "very_strong": "强力",
         }
         self._mask_processing_strength = strength_key
-        self.cfg._raw.setdefault("mask_processing", {})["strength"] = strength_key
+        config_snapshot = self.cfg.update_section("mask_processing", {"strength": strength_key})
         cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
-        save_json_atomic(cfg_path, self.cfg._raw)
+        save_json_atomic(cfg_path, config_snapshot)
         self.task_panel.set_mask_strength(strength_key)
         if getattr(self.state, 'mask_processed', False):
             self._invalidate_analysis_from(
@@ -1494,7 +1555,7 @@ class MainWindow(QMainWindow):
                 float(mask_result.get("main_angle", 0.0) or 0.0),
                 geo=self.geo,
                 state=self.state,
-                config=dict(self.cfg._raw.get("path_planning", {})),
+                config=self.cfg.section("path_planning"),
             )
             if lines:
                 first = lines[0]
@@ -1557,6 +1618,7 @@ class MainWindow(QMainWindow):
 
     def _place_entry_exit_point(self, x, y):
         self._service_points_visible = True
+        had_path = bool(getattr(self.state, "auto_path_planned", False))
         idx = self._entry_exit_click_idx
         label = "设置起点" if idx == 0 else ("设置终点" if idx == 1 else "新增卸粮点")
         self._save_system_undo(label)
@@ -1575,6 +1637,11 @@ class MainWindow(QMainWindow):
                 unload_point_locked=True,
             )
             self.log_panel.success(f"卸粮点 #{len(pts)}: ({x}, {y})")
+        if had_path:
+            self._invalidate_analysis_from(
+                "path",
+                "起点、终点或卸粮点已变化，必须重新规划和验证",
+            )
         self._restore_visual_from_state()
         self._refresh_service_points_panel()
         self._sync_task_statuses()
@@ -1590,6 +1657,28 @@ class MainWindow(QMainWindow):
         if not self.model_engine.is_loaded():
             QMessageBox.warning(self, "提示", "请先加载模型")
             return
+        model_path = str(getattr(self.state, "current_model_path", "") or "")
+        if model_path:
+            try:
+                from provenance import file_sha256
+                current_model_sha256 = file_sha256(model_path)
+            except OSError as exc:
+                QMessageBox.warning(self, "模型文件不可用", f"无法读取当前模型文件：{exc}")
+                return
+            loaded_model_sha256 = str(getattr(self.state, "model_sha256", "") or "")
+            if loaded_model_sha256 and loaded_model_sha256 != current_model_sha256:
+                self.model_engine.unload()
+                self._invalidate_analysis_from(
+                    "inference",
+                    "模型文件内容已在加载后发生变化，必须重新加载模型并重新识别",
+                )
+                QMessageBox.warning(
+                    self,
+                    "模型内容已变化",
+                    "当前 .pt 文件与已加载模型的哈希不一致。为避免错误归因，已停止识别，请重新加载模型。",
+                )
+                return
+            self.state.model_sha256 = current_model_sha256
         if getattr(self.state, 'inference_running', False):
             QMessageBox.warning(self, "提示", "AI 识别正在运行")
             return
@@ -1783,6 +1872,95 @@ class MainWindow(QMainWindow):
             if isinstance(segment, dict)
         )
 
+    def _verify_scientific_provenance(self, path_result):
+        """Verify every cached artifact against current inputs before export."""
+        from model import INFERENCE_PIPELINE_VERSION
+        from path_planner import PATH_PLANNING_VERSION
+        from provenance import ProvenanceError, file_sha256, verify_stage_record
+        from row_geometry import MASK_REGULARIZATION_VERSION
+
+        raw_mask = getattr(self.state, "mask_raw", None)
+        processed_result = getattr(self.state, "mask_result", None) or {}
+        processed_mask = processed_result.get("processed_mask")
+        if not isinstance(raw_mask, np.ndarray) or not isinstance(processed_mask, np.ndarray):
+            raise ProvenanceError("缺少可验证的原始或处理后掩膜")
+
+        inference_record = dict(getattr(self.state, "inference_provenance", {}) or {})
+        inference_inputs = dict(inference_record.get("inputs") or {})
+        model_path = str(getattr(self.state, "current_model_path", "") or "")
+        if not model_path or not os.path.isfile(model_path):
+            raise ProvenanceError("生成识别结果的模型文件不存在")
+        current_model_sha256 = file_sha256(model_path)
+        source_sha256 = str(getattr(self.state, "source_sha256", "") or "")
+        if not source_sha256:
+            raise ProvenanceError("源影像完整 SHA-256 缺失")
+        inference_inputs.update({
+            "source_sha256": source_sha256,
+            "model_sha256": current_model_sha256,
+            "inference_config": {
+                "capture_size": int(self.cfg.TILE_CAPTURE_SIZE),
+                "overlap": float(self.cfg.TILE_OVERLAP),
+                "conf": float(self.cfg.MODEL_CONF),
+                "iou": float(self.cfg.MODEL_IOU),
+                "batch_size": 4,
+            },
+            "preprocessing_config": self.cfg.section("raster_preprocessing"),
+        })
+        if str(inference_record.get("algorithm_version", "")) != INFERENCE_PIPELINE_VERSION:
+            raise ProvenanceError("AI 推理算法版本不一致")
+        verify_stage_record(inference_record, "inference", inference_inputs, raw_mask)
+
+        mask_record = dict(
+            getattr(self.state, "mask_provenance", {})
+            or processed_result.get("provenance")
+            or {}
+        )
+        mask_inputs = dict(mask_record.get("inputs") or {})
+        mask_inputs.update({
+            "inference_fingerprint": str(inference_record.get("fingerprint", "")),
+            "raw_mask_sha256": str(inference_record.get("artifact_sha256", "")),
+            "mask_config": self.cfg.section("mask_processing"),
+        })
+        if str(mask_record.get("algorithm_version", "")) != str(MASK_REGULARIZATION_VERSION):
+            raise ProvenanceError("掩膜处理算法版本不一致")
+        verify_stage_record(mask_record, "mask", mask_inputs, processed_mask)
+
+        path_record = dict(
+            path_result.get("provenance")
+            or getattr(self.state, "path_provenance", {})
+            or {}
+        )
+        current_harvester = self._effective_harvester_params(
+            getattr(self.state, "harvester_params", {}) or {}
+        )
+        path_config = self.cfg.section("path_planning")
+        path_config.update({
+            "min_turn_radius_m": float(current_harvester["turn_radius_m"]),
+            "turn_strategy": str(getattr(self.state, "turn_strategy", "auto")),
+        })
+        path_inputs = dict(path_record.get("inputs") or {})
+        path_inputs.update({
+            "mask_fingerprint": str(mask_record.get("fingerprint", "")),
+            "path_config": path_config,
+            "harvester": current_harvester,
+            "turn_strategy": str(getattr(self.state, "turn_strategy", "auto")),
+            "entry_point": getattr(self.state, "entry_point", None),
+            "exit_point": getattr(self.state, "exit_point", None),
+            "unload_points": list(getattr(self.state, "unload_points", []) or []),
+        })
+        path_artifact = {
+            "full_path": path_result.get("full_path", []),
+            "segment_types": path_result.get("segment_types", []),
+        }
+        if str(path_record.get("algorithm_version", "")) != PATH_PLANNING_VERSION:
+            raise ProvenanceError("路径规划算法版本不一致")
+        verify_stage_record(path_record, "path", path_inputs, path_artifact)
+        return {
+            "inference": inference_record,
+            "mask": mask_record,
+            "path": path_record,
+        }
+
     def _geo_export_payload(self):
         if not self.geo.is_ready():
             raise ValueError("当前影像没有可用地理坐标，不能导出经纬度文件")
@@ -1853,6 +2031,7 @@ class MainWindow(QMainWindow):
                             f"segment={segment_index}, point={point_index}, "
                             f"pixel=({float(pixel_x):.3f},{float(pixel_y):.3f})"
                         )
+        self._verify_scientific_provenance(path_result)
         expected_count = self._path_result_point_count(path_result)
         from path_planner import global_path_to_geo, validate_geo_points
 
@@ -1887,7 +2066,7 @@ class MainWindow(QMainWindow):
         if isinstance(value, np.ndarray):
             return value.tolist()
         if isinstance(value, np.generic):
-            return value.item()
+            return MainWindow._manifest_jsonable(value.item())
         if isinstance(value, dict):
             return {
                 str(key): MainWindow._manifest_jsonable(item)
@@ -1895,6 +2074,8 @@ class MainWindow(QMainWindow):
             }
         if isinstance(value, (list, tuple)):
             return [MainWindow._manifest_jsonable(item) for item in value]
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
         return str(value)
@@ -1922,6 +2103,7 @@ class MainWindow(QMainWindow):
     def _write_export_manifest(self, output_path, output_format, path_result, geo_points):
         from importlib import metadata
         from cache import source_identity
+        from provenance import APP_VERSION, code_identity, git_is_dirty, git_revision
 
         package_names = (
             "numpy", "opencv-python", "PySide6", "pyproj",
@@ -1934,7 +2116,7 @@ class MainWindow(QMainWindow):
             except metadata.PackageNotFoundError:
                 versions[package] = "not-installed"
 
-        config_data = self._manifest_jsonable(self.cfg._raw)
+        config_data = self._manifest_jsonable(self.cfg.snapshot())
         config_bytes = json.dumps(
             config_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
@@ -1946,15 +2128,44 @@ class MainWindow(QMainWindow):
         mask_result = getattr(self.state, "mask_result", None) or {}
         diagnostics = mask_result.get("diagnostics", {}) if isinstance(mask_result, dict) else {}
         extent = {}
+        source_metadata = dict(getattr(self.state, "source_metadata", {}) or {})
         if self.geo.is_ready() and isinstance(self._tif_rgb, np.ndarray):
-            try:
-                height, width = self._tif_rgb.shape[:2]
-                extent = self.geo.validate_raster_extent(width, height)
-            except Exception:
-                extent = {}
+            height, width = self._tif_rgb.shape[:2]
+            extent = self.geo.validate_raster_extent(width, height)
+            center = (width / 2.0, height / 2.0)
+            gsd_x = float(self.geo.pixel_distance_m(center, (center[0] + 1.0, center[1])))
+            gsd_y = float(self.geo.pixel_distance_m(center, (center[0], center[1] + 1.0)))
+            source_metadata["display_gsd_m"] = {
+                "x": gsd_x,
+                "y": gsd_y,
+                "anisotropy_ratio": max(gsd_x, gsd_y) / min(gsd_x, gsd_y),
+            }
 
+        source_sha256 = str(getattr(self.state, "source_sha256", "") or "")
+        if not source_sha256:
+            raise ValueError("源影像完整 SHA-256 缺失，不能生成科研溯源清单")
+
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        scientific_code = code_identity(project_root, [
+            "geo.py",
+            "model.py",
+            "raster_preprocessing.py",
+            "mask_processor.py",
+            "row_geometry.py",
+            "planning.py",
+            "footprint_planner.py",
+            "path_planner.py",
+            "provenance.py",
+            "config.py",
+            "cache.py",
+            "pyside6_app/workers.py",
+        ])
         manifest = {
-            "schema": 1,
+            "schema": 2,
+            "application_version": APP_VERSION,
+            "git_revision": git_revision(project_root),
+            "git_dirty": git_is_dirty(project_root),
+            "scientific_code": scientific_code,
             "created_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
             "output": {
                 "path": os.path.abspath(output_path),
@@ -1966,12 +2177,19 @@ class MainWindow(QMainWindow):
             "source_image": {
                 "path": os.path.abspath(self._tif_path) if self._tif_path else "",
                 "identity": source_identity(self._tif_path) if self._tif_path else {},
+                "sha256": source_sha256,
+                "metadata": self._manifest_jsonable(
+                    source_metadata
+                ),
                 "geographic_extent": extent,
             },
             "model": {
                 "name": str(getattr(self.state, "current_model_name", "") or ""),
                 "path": os.path.abspath(model_path) if model_path else "",
                 "sha256": self._sha256_file(model_path),
+                "registry": self._manifest_jsonable(
+                    self._model_registry_entry(model_path)
+                ),
             },
             "analysis": {
                 "mask_algorithm_version": diagnostics.get("algorithm_version"),
@@ -1987,6 +2205,19 @@ class MainWindow(QMainWindow):
                 "planning_factors": self._manifest_jsonable(
                     path_result.get("planning_factors", {}) or {}
                 ),
+                "stage_provenance": {
+                    "inference": self._manifest_jsonable(
+                        getattr(self.state, "inference_provenance", {}) or {}
+                    ),
+                    "mask": self._manifest_jsonable(
+                        getattr(self.state, "mask_provenance", {}) or {}
+                    ),
+                    "path": self._manifest_jsonable(
+                        path_result.get("provenance")
+                        or getattr(self.state, "path_provenance", {})
+                        or {}
+                    ),
+                },
             },
             "integrity": {
                 "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
@@ -1995,6 +2226,21 @@ class MainWindow(QMainWindow):
             "runtime": {
                 "python": sys.version,
                 "packages": versions,
+                "gdal_data": os.environ.get("GDAL_DATA", ""),
+                "proj_data": os.environ.get("PROJ_DATA", ""),
+                "stages": {
+                    "inference": self._manifest_jsonable(
+                        getattr(self.state, "inference_runtime", {}) or {}
+                    ),
+                    "mask": self._manifest_jsonable(
+                        (getattr(self.state, "mask_result", None) or {}).get("runtime", {})
+                    ),
+                    "path": self._manifest_jsonable(
+                        path_result.get("runtime")
+                        or getattr(self.state, "path_runtime", {})
+                        or {}
+                    ),
+                },
             },
         }
         manifest_path = str(output_path) + ".manifest.json"
@@ -2056,6 +2302,8 @@ class MainWindow(QMainWindow):
             "validation": {"valid": bool(saved.get("auto_path_valid", False))},
             "description": saved.get("auto_path_desc", ""),
             "geo_points": saved.get("auto_path_geo", []),
+            "provenance": saved.get("path_provenance", {}),
+            "runtime": saved.get("path_runtime", {}),
         }
         return self._store_path_result(path_result, {"path": path_result})
 
@@ -2092,6 +2340,8 @@ class MainWindow(QMainWindow):
             auto_path_planned=bool(auto_segments),
             path_points=flat_points,
             path_status=flat_status,
+            path_provenance=dict(normalised.get("provenance") or {}),
+            path_runtime=dict(normalised.get("runtime") or {}),
         )
 
         result = dict(pipeline_result or self._pipeline_result or {})
@@ -2186,7 +2436,11 @@ class MainWindow(QMainWindow):
             self.task_panel.set_task_action("process", "\u91cd\u505a")
             if isinstance(data, dict):
                 processed_mask = data.get("processed_mask")
-                self.state.safe_update(mask_processed=True, mask_result=data)
+                self.state.safe_update(
+                    mask_processed=True,
+                    mask_result=data,
+                    mask_provenance=dict(data.get("provenance") or {}),
+                )
                 if isinstance(processed_mask, np.ndarray):
                     self._show_mask_overlay(processed_mask)
             elif isinstance(data, np.ndarray):
@@ -2211,7 +2465,11 @@ class MainWindow(QMainWindow):
                 inference_done=True,
             )
         if isinstance(result.get("processed"), dict):
-            self.state.safe_update(mask_processed=True, mask_result=result["processed"])
+            self.state.safe_update(
+                mask_processed=True,
+                mask_result=result["processed"],
+                mask_provenance=dict(result["processed"].get("provenance") or {}),
+            )
         pr = self._store_path_result(result.get("path", {}), result)
         self.top_toolbar.set_progress(0)
         self.progress_bar.hide()
@@ -2259,7 +2517,11 @@ class MainWindow(QMainWindow):
         processed = self._compact_mask_result_for_ui(processed)
         processed_mask = processed.get("processed_mask", processed_mask)
         self._save_processed_mask_async(processed_mask)
-        self.state.safe_update(mask_processed=True, mask_result=processed)
+        self.state.safe_update(
+            mask_processed=True,
+            mask_result=processed,
+            mask_provenance=dict(processed.get("provenance") or {}),
+        )
         centers = [b for b in wide_bands if b.get("centerline")]
         self.log_panel.success(f"掩膜处理完成: {len(wide_bands)} 条带, {len(centers)} 条中心线")
         self.task_panel.set_task_status("process", "done")
@@ -2369,7 +2631,7 @@ class MainWindow(QMainWindow):
             "mask",
             "已开始新的掩膜处理，本次结果提交前不保留旧处理结果和路径",
         )
-        mask_config = dict(self.cfg._raw.get("mask_processing", {}))
+        mask_config = self.cfg.section("mask_processing")
         mask_config["strength"] = self._mask_processing_strength
         worker = MaskProcessWorker(mask, self.geo, self.state, mask_config)
         worker.finished.connect(self._on_mask_worker_done)
@@ -2923,7 +3185,7 @@ class MainWindow(QMainWindow):
         cv2.imwrite(path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
         self.log_panel.success(f"已保存图像: {path}")
     def _on_params_dialog(self):
-        dlg = HarvesterParamsDialog(self.cfg._raw.get("harvester", {}), self)
+        dlg = HarvesterParamsDialog(self.cfg.section("harvester"), self)
         if dlg.exec() == QDialog.Accepted:
             p = dlg.get_params()
             previous = self._effective_harvester_params(
@@ -2939,9 +3201,9 @@ class MainWindow(QMainWindow):
                 f"轴距={p['wheelbase_m']:.2f}m, "
                 f"转弯半径={p['turn_radius_m']:.2f}m"
             )
-            self.cfg._raw.setdefault("harvester", {}).update(p)
+            config_snapshot = self.cfg.update_section("harvester", p)
             cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
-            save_json_atomic(cfg_path, self.cfg._raw)
+            save_json_atomic(cfg_path, config_snapshot)
             if (
                 getattr(self.state, "auto_path_planned", False)
                 and any(
@@ -2956,9 +3218,27 @@ class MainWindow(QMainWindow):
             self._sync_task_statuses()
 
     def _on_settings_dialog(self):
-        if SettingsDialog(self.cfg._raw, self).exec() == QDialog.Accepted:
-            self._mask_processing_strength = str(self.cfg._raw.get("mask_processing", {}).get("strength", "standard"))
+        previous = self.cfg.snapshot()
+        if SettingsDialog(self.cfg.snapshot(), self).exec() == QDialog.Accepted:
+            self.cfg.load()
+            current = self.cfg.snapshot()
+            self._mask_processing_strength = str(self.cfg.section("mask_processing").get("strength", "standard"))
             self.task_panel.set_mask_strength(self._mask_processing_strength)
+            if previous.get("model", {}) != current.get("model", {}):
+                self._invalidate_analysis_from(
+                    "inference",
+                    "AI 推理参数已变化，旧识别掩膜和路径不能继续使用",
+                )
+            elif previous.get("mask_processing", {}) != current.get("mask_processing", {}):
+                self._invalidate_analysis_from(
+                    "mask",
+                    "掩膜处理参数已变化，必须重新处理和规划",
+                )
+            elif previous.get("path_planning", {}) != current.get("path_planning", {}):
+                self._invalidate_analysis_from(
+                    "path",
+                    "路径规划参数已变化，必须重新规划和验证",
+                )
 
     def _on_project_log(self):
         entries = self._journal.recent(100)
@@ -3098,9 +3378,9 @@ class MainWindow(QMainWindow):
             params = self._effective_harvester_params(dlg.get_params())
             self._save_system_undo("应用农机尺寸建议")
             self.state.harvester_params = params
-            self.cfg._raw.setdefault("harvester", {}).update(params)
+            config_snapshot = self.cfg.update_section("harvester", params)
             cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
-            save_json_atomic(cfg_path, self.cfg._raw)
+            save_json_atomic(cfg_path, config_snapshot)
             if getattr(self.state, "auto_path_planned", False):
                 self._invalidate_analysis_from(
                     "path",
@@ -3184,7 +3464,7 @@ class MainWindow(QMainWindow):
             return
         points = []
         statuses = []
-        tolerance_m = max(0.005, float(self.cfg._raw.get("ui", {}).get("route_edit_tolerance_m", 0.02)))
+        tolerance_m = max(0.005, float(self.cfg.section("ui").get("route_edit_tolerance_m", 0.02)))
 
         def simplify(source_points):
             values = np.asarray(source_points, dtype=np.float32)
@@ -3262,6 +3542,8 @@ class MainWindow(QMainWindow):
         st.auto_path_planned = True
         st.auto_path_valid = False
         st.auto_path_desc = "路线已手动编辑，覆盖率与碾压率需重新规划后评估"
+        st.path_provenance = {}
+        st.path_runtime = {}
         st.last_work_path_m = sum(item.length_m for item in segments if item.segment_type == "work")
         st.last_turn_path_m = sum(item.length_m for item in segments if item.segment_type.startswith("turn"))
         st.last_entry_exit_path_m = sum(item.length_m for item in segments if item.segment_type in ("entry", "exit"))

@@ -1,5 +1,5 @@
 """模型加载 + 分块推理 + 后台推理运行器"""
-import os, math, threading, traceback
+import os, math, threading, time, traceback
 from typing import Optional, List, Tuple, Any, Dict
 import numpy as np
 import cv2
@@ -9,6 +9,8 @@ from state import AppState
 from geo import GeoUtils
 # 掩膜处理和路径规划由独立步骤负责，不在推理运行器中调用
 
+
+INFERENCE_PIPELINE_VERSION = "source-tif-sahi-v2"
 
 
 # ─── ModelEngine ────────────────────────────────────────────
@@ -249,6 +251,7 @@ class InferenceRunner:
             mask_raw=None,
             inference_original_mask=None,
             inference_done=False,
+            inference_provenance={},
             inference_running=True,
             inference_progress=0.0,
             status_message="正在运行 AI 推理...",
@@ -265,6 +268,7 @@ class InferenceRunner:
             mask_raw=None,
             inference_original_mask=None,
             inference_done=False,
+            inference_provenance={},
             inference_running=True,
             inference_progress=0.0,
             status_message="正在读取原始影像执行 AI 推理...",
@@ -279,9 +283,11 @@ class InferenceRunner:
     def _run_from_tif(self, tif_path: str, display_shape: Tuple[int, int],
                       field_boundary: Optional[List] = None, downsample: int = 1):
         succeeded = False
+        started_at = time.perf_counter()
         try:
             import rasterio
             from rasterio.windows import Window
+            from raster_preprocessing import read_rgb_raster
 
             if not field_boundary or len(field_boundary) < 3:
                 self.state.safe_update(status_message="推理失败：请先圈选田块", inference_running=False)
@@ -313,7 +319,7 @@ class InferenceRunner:
                 crop_h = int(y1_src - y0_src)
                 crop_pixels = crop_w * crop_h
                 max_crop_pixels = int(
-                    Config()._raw.get("model", {}).get(
+                    Config().section("model").get(
                         "max_source_crop_pixels",
                         36_000_000,
                     )
@@ -331,18 +337,11 @@ class InferenceRunner:
                         inference_running=False,
                     )
                     return
-                img = src.read(
-                    list(range(1, min(3, src.count) + 1)),
+                crop_img, preprocessing = read_rgb_raster(
+                    src,
                     window=Window(x0_src, y0_src, x1_src - x0_src, y1_src - y0_src),
+                    config=self.cfg.section("raster_preprocessing"),
                 )
-
-            crop_img = np.ascontiguousarray(np.moveaxis(img[:3], 0, -1)) if img.shape[0] >= 3 else np.stack([img[0]] * 3, axis=-1)
-            if crop_img.max() > 255:
-                crop_img = (crop_img / max(float(crop_img.max()), 1.0) * 255).astype(np.uint8)
-            elif crop_img.max() <= 1.0:
-                crop_img = (crop_img * 255).astype(np.uint8)
-            else:
-                crop_img = crop_img.astype(np.uint8, copy=False)
 
             local_src = pts_source.copy()
             local_src[:, 0] -= x0_src
@@ -383,10 +382,40 @@ class InferenceRunner:
             out_h = max(1, y1_d - y0_d)
             mask = cv2.resize(crop_mask_src, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
             boundary_meta = [[float(px), float(py)] for px, py in (self.state.field_boundary or [])]
+            from provenance import file_sha256, make_stage_record
+            source_sha256 = str(getattr(self.state, "source_sha256", "") or "")
+            if not source_sha256:
+                source_sha256 = file_sha256(tif_path)
+            model_path = str(getattr(self.state, "current_model_path", "") or "")
+            model_sha256 = str(getattr(self.state, "model_sha256", "") or "")
+            if model_path and not model_sha256:
+                model_sha256 = file_sha256(model_path)
+            inference_config = {
+                "capture_size": int(self.cfg.TILE_CAPTURE_SIZE),
+                "overlap": float(self.cfg.TILE_OVERLAP),
+                "conf": float(self.cfg.MODEL_CONF),
+                "iou": float(self.cfg.MODEL_IOU),
+                "batch_size": 4,
+            }
+            provenance_inputs = {
+                "source_sha256": source_sha256,
+                "model_sha256": model_sha256,
+                "field_boundary": boundary_meta,
+                "source_crop_window": [x0_src, y0_src, crop_w, crop_h],
+                "inference_config": inference_config,
+                "preprocessing_config": self.cfg.section("raster_preprocessing"),
+                "preprocessing": preprocessing,
+            }
+            inference_provenance = make_stage_record(
+                "inference", INFERENCE_PIPELINE_VERSION, provenance_inputs, mask
+            )
             cache_meta = {
                 "model": self.state.current_model_name or "",
                 "model_path": self.state.current_model_path or "",
-                "strategy": "source_tif_sahi_640_40p",
+                "strategy": INFERENCE_PIPELINE_VERSION,
+                "model_sha256": model_sha256,
+                "source_sha256": source_sha256,
+                "inference_provenance": inference_provenance,
                 "field_boundary": boundary_meta,
                 "field_area_m2": float(self.state.field_area_m2 or 0.0),
                 "source_crop_shape": [int(crop_mask_src.shape[0]), int(crop_mask_src.shape[1])],
@@ -398,6 +427,12 @@ class InferenceRunner:
             save_mask(self.state.tif_path, mask, x0_d, y0_d, meta=cache_meta)
             save_mask(self.state.tif_path, mask, x0_d, y0_d, suffix="_best", meta=cache_meta)
             non_zero = np.count_nonzero(mask)
+            inference_runtime = {
+                "stage": "inference",
+                "seconds": float(time.perf_counter() - started_at),
+                "source_crop_shape": [int(crop_h), int(crop_w)],
+                "display_mask_shape": [int(out_h), int(out_w)],
+            }
             self.state.safe_update(
                 mask_raw=mask,
                 inference_original_mask=mask,
@@ -405,6 +440,11 @@ class InferenceRunner:
                 mask_offset_y=y0_d,
                 _mask_overlay_dirty=True,
                 inference_done=True,
+                inference_provenance=inference_provenance,
+                raster_preprocessing=preprocessing,
+                source_sha256=source_sha256,
+                model_sha256=model_sha256,
+                inference_runtime=inference_runtime,
                 inference_progress=1.0,
                 status_message=f"AI 识别完成，原始影像推理掩膜已保存（非零像素: {non_zero}）。请执行「掩膜处理」。",
             )
@@ -426,6 +466,7 @@ class InferenceRunner:
 
     def _run(self, image: np.ndarray, field_boundary: Optional[List] = None):
         succeeded = False
+        started_at = time.perf_counter()
         try:
             def progress_cb(pct: float):
                 self.state.safe_update(
@@ -497,10 +538,32 @@ class InferenceRunner:
                 inference_progress=0.97,
                 status_message="正在保存项目推理结果...",
             )
+            from provenance import array_sha256, file_sha256, make_stage_record
+            model_path = str(getattr(self.state, "current_model_path", "") or "")
+            model_sha256 = str(getattr(self.state, "model_sha256", "") or "")
+            if model_path and not model_sha256:
+                model_sha256 = file_sha256(model_path)
+            provenance_inputs = {
+                "source_array_sha256": array_sha256(full_image),
+                "model_sha256": model_sha256,
+                "field_boundary": boundary_meta,
+                "inference_config": {
+                    "capture_size": int(self.cfg.TILE_CAPTURE_SIZE),
+                    "overlap": float(self.cfg.TILE_OVERLAP),
+                    "conf": float(self.cfg.MODEL_CONF),
+                    "iou": float(self.cfg.MODEL_IOU),
+                    "batch_size": 4,
+                },
+            }
+            inference_provenance = make_stage_record(
+                "inference", INFERENCE_PIPELINE_VERSION, provenance_inputs, mask
+            )
             cache_meta = {
                 "model": self.state.current_model_name or "",
                 "model_path": self.state.current_model_path or "",
                 "strategy": "sahi_640_40p",
+                "model_sha256": model_sha256,
+                "inference_provenance": inference_provenance,
                 "field_boundary": boundary_meta,
                 "field_area_m2": float(self.state.field_area_m2 or 0.0),
             }
@@ -517,6 +580,14 @@ class InferenceRunner:
                 mask_offset_y=y0,
                 _mask_overlay_dirty=True,
                 inference_done=True,
+                inference_provenance=inference_provenance,
+                model_sha256=model_sha256,
+                inference_runtime={
+                    "stage": "inference",
+                    "seconds": float(time.perf_counter() - started_at),
+                    "source_crop_shape": [int(mask.shape[0]), int(mask.shape[1])],
+                    "display_mask_shape": [int(mask.shape[0]), int(mask.shape[1])],
+                },
                 inference_progress=1.0,
                 status_message=f"AI 识别完成，原始掩膜已保存（非零像素: {non_zero}）。请执行「掩膜处理」。",
             )

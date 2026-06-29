@@ -1,5 +1,5 @@
 {
-  "_schema_version": "1.1",
+  "_schema_version": "1.2",
   "window": {
     "width": 1500,
     "height": 900,
@@ -55,8 +55,15 @@
     "band_width_threshold_m": 0.55,
     "band_auto_calibrate": true
   },
+  "raster_preprocessing": {
+    "mode": "percentile_per_band",
+    "lower_percentile": 2.0,
+    "upper_percentile": 98.0
+  },
   "geo": {
-    "default_epsg": "32650"
+    "default_epsg": "32650",
+    "max_pixel_anisotropy_ratio": 1.15,
+    "max_gsd_variation_ratio": 0.1
   },
   "ui": {
     "language": "zh",

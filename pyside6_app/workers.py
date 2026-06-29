@@ -39,6 +39,39 @@ def require_metric_scale(geo, state, shape) -> float:
     )
     if not np.isfinite(value) or not 1e-5 <= value <= 5.0:
         raise RuntimeError(f"影像地面分辨率无效: {value!r} m/px")
+    if hasattr(geo, "pixel_distance_m"):
+        samples = [
+            (offset_x + width / 2.0, offset_y + height / 2.0),
+            (offset_x, offset_y),
+            (offset_x + max(0, width - 2), offset_y),
+            (offset_x, offset_y + max(0, height - 2)),
+            (offset_x + max(0, width - 2), offset_y + max(0, height - 2)),
+        ]
+        means = []
+        anisotropy = []
+        for px, py in samples:
+            dx = float(geo.pixel_distance_m((px, py), (px + 1.0, py)))
+            dy = float(geo.pixel_distance_m((px, py), (px, py + 1.0)))
+            if not np.isfinite(dx) or not np.isfinite(dy) or min(dx, dy) <= 0.0:
+                raise RuntimeError("影像横向或纵向地面分辨率无效")
+            means.append((dx + dy) / 2.0)
+            anisotropy.append(max(dx, dy) / min(dx, dy))
+        from config import Config
+        geo_config = Config().section("geo")
+        max_anisotropy = float(geo_config.get("max_pixel_anisotropy_ratio", 1.15))
+        max_variation = float(geo_config.get("max_gsd_variation_ratio", 0.10))
+        if max(anisotropy) > max_anisotropy:
+            raise RuntimeError(
+                f"影像像素横纵尺度差异过大: ratio={max(anisotropy):.4f}, "
+                f"limit={max_anisotropy:.4f}"
+            )
+        variation = max(means) / min(means) - 1.0
+        if variation > max_variation:
+            raise RuntimeError(
+                f"影像范围内地面分辨率变化过大: variation={variation:.2%}, "
+                f"limit={max_variation:.2%}"
+            )
+        value = float(np.median(means))
     return value
 
 
@@ -62,6 +95,9 @@ class TifLoadWorker(QObject):
             import rasterio
             from rasterio.enums import Resampling
             from pyproj import Transformer
+            from config import Config
+            from provenance import file_sha256
+            from raster_preprocessing import read_rgb_raster
             with rasterio.open(self.path) as src:
                 crs = src.crs
                 transform = src.transform
@@ -80,8 +116,6 @@ class TifLoadWorker(QObject):
                     geo_error = "GeoTIFF has a CRS but no valid affine geotransform"
                 else:
                     geo_error = "GeoTIFF has no CRS"
-                bands = min(3, src.count)
-                band_idx = list(range(1, bands + 1))
                 full_h, full_w = src.height, src.width
                 # Display should not load the full 15k×21k raster into a QPixmap.
                 # Keep the longest display side bounded; processing uses masks/caches,
@@ -91,24 +125,31 @@ class TifLoadWorker(QObject):
                 out_h = max(1, full_h // downsample)
                 out_w = max(1, full_w // downsample)
                 self.progress.emit(25, f"正在读取影像预览 {out_w}×{out_h}...")
-                img = src.read(
-                    band_idx,
-                    out_shape=(bands, out_h, out_w),
+                rgb, preview_preprocessing = read_rgb_raster(
+                    src,
+                    out_shape=(out_h, out_w),
                     resampling=Resampling.average,
+                    config=Config().section("raster_preprocessing"),
                 )
+                source_metadata = {
+                    "width": int(src.width),
+                    "height": int(src.height),
+                    "band_count": int(src.count),
+                    "dtypes": list(src.dtypes),
+                    "nodata": [
+                        None if value is None or not np.isfinite(float(value)) else float(value)
+                        for value in src.nodatavals
+                    ],
+                    "color_interpretation": [
+                        getattr(value, "name", str(value)) for value in src.colorinterp
+                    ],
+                    "crs": str(crs) if crs else "",
+                    "affine": [float(value) for value in tuple(transform)[:6]],
+                }
             if self._cancelled:
                 return
-            self.progress.emit(75, "正在转换显示图像...")
-            if img.shape[0] >= 3:
-                rgb = np.ascontiguousarray(np.moveaxis(img[:3], 0, -1))
-            else:
-                rgb = np.stack([img[0]] * 3, axis=-1)
-            if rgb.max() > 255:
-                rgb = (rgb / max(float(rgb.max()), 1.0) * 255).astype(np.uint8)
-            elif rgb.max() <= 1.0:
-                rgb = (rgb * 255).astype(np.uint8)
-            else:
-                rgb = rgb.astype(np.uint8, copy=False)
+            self.progress.emit(75, "正在计算源影像完整性哈希...")
+            source_sha256 = file_sha256(self.path)
             self.finished.emit({
                 "path": self.path,
                 "rgb": rgb,
@@ -124,6 +165,9 @@ class TifLoadWorker(QObject):
                 "source_transform": transform,
                 "transformer": transformer,
                 "geo_error": geo_error,
+                "source_sha256": source_sha256,
+                "source_metadata": source_metadata,
+                "preview_preprocessing": preview_preprocessing,
             })
         except Exception as e:
             self.error.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -135,9 +179,10 @@ class CacheRestoreWorker(QObject):
     finished = Signal(dict)
     error = Signal(str)
 
-    def __init__(self, path: str, parent=None):
+    def __init__(self, path: str, expected_source_sha256: str = "", parent=None):
         super().__init__(parent)
         self.path = path
+        self.expected_source_sha256 = str(expected_source_sha256 or "")
         self._cancelled = False
 
     def cancel(self):
@@ -148,34 +193,118 @@ class CacheRestoreWorker(QObject):
             self.progress.emit(10, "正在读取项目缓存...")
             from cache import load_project_state, load_mask
             from row_geometry import MASK_REGULARIZATION_VERSION
-            saved = load_project_state(self.path)
+            saved = load_project_state(self.path, self.expected_source_sha256)
             if self._cancelled or not saved:
                 self.finished.emit({"path": self.path, "saved": {}})
                 return
-            mask_result_summary = saved.get("mask_result") or {}
-            diagnostics = (
-                mask_result_summary.get("diagnostics", {})
-                if isinstance(mask_result_summary, dict)
-                else {}
-            )
             from config import Config
-            current_strength = str(Config()._raw.get("mask_processing", {}).get("strength", "standard"))
-            cached_strength = str(diagnostics.get("strength", "standard"))
-            processed_cache_valid = (
-                bool(saved.get('mask_processed'))
-                and diagnostics.get("algorithm_version") == MASK_REGULARIZATION_VERSION
-                and cached_strength == current_strength
-            )
+            from model import INFERENCE_PIPELINE_VERSION
+            from path_planner import PATH_PLANNING_VERSION
+            from provenance import ProvenanceError, file_sha256, verify_stage_record
+            cfg = Config()
             self.progress.emit(35, "正在读取 AI 掩膜缓存...")
             raw_mask, raw_ox, raw_oy = load_mask(self.path, "") if saved.get('inference_done') else (None, 0, 0)
+            reasons = []
+            inference_valid = False
+            inference_record = saved.get("inference_provenance") or {}
+            try:
+                if raw_mask is None:
+                    raise ProvenanceError("inference artifact is missing")
+                current_inputs = dict(inference_record.get("inputs") or {})
+                current_inputs["source_sha256"] = self.expected_source_sha256 or saved.get("source_sha256", "")
+                model_path = str(saved.get("current_model_path", "") or "")
+                if not model_path or not os.path.isfile(model_path):
+                    raise ProvenanceError("inference model file is missing")
+                current_inputs["model_sha256"] = file_sha256(model_path)
+                current_inputs["inference_config"] = {
+                    "capture_size": int(cfg.TILE_CAPTURE_SIZE),
+                    "overlap": float(cfg.TILE_OVERLAP),
+                    "conf": float(cfg.MODEL_CONF),
+                    "iou": float(cfg.MODEL_IOU),
+                    "batch_size": 4,
+                }
+                current_inputs["preprocessing_config"] = cfg.section("raster_preprocessing")
+                if str(inference_record.get("algorithm_version", "")) != INFERENCE_PIPELINE_VERSION:
+                    raise ProvenanceError("inference algorithm version changed")
+                verify_stage_record(inference_record, "inference", current_inputs, raw_mask)
+                inference_valid = True
+            except Exception as exc:
+                reasons.append(f"AI 掩膜缓存失效: {exc}")
+                saved["inference_done"] = False
+                saved["mask_processed"] = False
+                saved["auto_path_planned"] = False
+                raw_mask = None
+
             self.progress.emit(65, "正在读取掩膜处理缓存...")
-            processed_mask, proc_ox, proc_oy = load_mask(self.path, "_processed") if processed_cache_valid else (None, 0, 0)
+            processed_mask, proc_ox, proc_oy = (
+                load_mask(self.path, "_processed")
+                if inference_valid and saved.get("mask_processed")
+                else (None, 0, 0)
+            )
+            processed_cache_valid = False
+            mask_record = saved.get("mask_provenance") or {}
+            try:
+                if not inference_valid or processed_mask is None:
+                    raise ProvenanceError("mask artifact is missing or its inference input is invalid")
+                mask_inputs = dict(mask_record.get("inputs") or {})
+                mask_inputs["inference_fingerprint"] = str(inference_record.get("fingerprint", ""))
+                mask_inputs["raw_mask_sha256"] = str(inference_record.get("artifact_sha256", ""))
+                mask_inputs["mask_config"] = cfg.section("mask_processing")
+                if str(mask_record.get("algorithm_version", "")) != str(MASK_REGULARIZATION_VERSION):
+                    raise ProvenanceError("mask algorithm version changed")
+                verify_stage_record(mask_record, "mask", mask_inputs, processed_mask)
+                processed_cache_valid = True
+            except Exception as exc:
+                if saved.get("mask_processed"):
+                    reasons.append(f"掩膜处理缓存失效: {exc}")
+                saved["mask_processed"] = False
+                saved["auto_path_planned"] = False
+                processed_mask = None
+
+            path_cache_valid = False
+            path_record = saved.get("path_provenance") or {}
+            try:
+                if not processed_cache_valid or not saved.get("auto_path_planned"):
+                    raise ProvenanceError("path input mask is invalid or path is absent")
+                path_inputs = dict(path_record.get("inputs") or {})
+                path_inputs["mask_fingerprint"] = str(mask_record.get("fingerprint", ""))
+                current_path_config = cfg.section("path_planning")
+                harvester = dict(saved.get("harvester_params") or {})
+                current_path_config.update({
+                    "min_turn_radius_m": float(harvester.get("turn_radius_m", cfg.MIN_TURN_RADIUS_M)),
+                    "turn_strategy": str(saved.get("turn_strategy", "auto")),
+                })
+                path_inputs.update({
+                    "path_config": current_path_config,
+                    "harvester": harvester,
+                    "turn_strategy": str(saved.get("turn_strategy", "auto")),
+                    "entry_point": saved.get("entry_point"),
+                    "exit_point": saved.get("exit_point"),
+                    "unload_points": list(saved.get("unload_points") or []),
+                })
+                path_artifact = {
+                    "full_path": [item.get("points", []) for item in saved.get("auto_path", [])],
+                    "segment_types": [item.get("segment_type", "work") for item in saved.get("auto_path", [])],
+                }
+                if str(path_record.get("algorithm_version", "")) != PATH_PLANNING_VERSION:
+                    raise ProvenanceError("path algorithm version changed")
+                verify_stage_record(path_record, "path", path_inputs, path_artifact)
+                path_cache_valid = True
+            except Exception as exc:
+                if saved.get("auto_path_planned"):
+                    reasons.append(f"路径缓存失效: {exc}")
+                saved["auto_path_planned"] = False
+                saved["auto_path_valid"] = False
+                saved["simulation_done"] = False
+                saved["export_done"] = False
             if self._cancelled:
                 return
             self.finished.emit({
                 "path": self.path,
                 "saved": saved,
                 "processed_cache_valid": processed_cache_valid,
+                "path_cache_valid": path_cache_valid,
+                "cache_validation_messages": reasons,
                 "raw_mask": raw_mask,
                 "raw_ox": raw_ox,
                 "raw_oy": raw_oy,
@@ -250,7 +379,7 @@ class PipelineWorker(QObject):
             self.progress.emit(40, "掩膜处理中...")
             from mask_processor import process_mask, extract_centerlines
             from config import Config
-            mask_config = dict(Config()._raw.get("mask_processing", {}))
+            mask_config = Config().section("mask_processing")
             require_metric_scale(self.geo, self.state, raw_mask.shape)
             processed = process_mask(
                 raw_mask,
@@ -371,6 +500,7 @@ class MaskProcessWorker(QObject):
 
     def run(self):
         previous_cv_threads = None
+        started_at = time.perf_counter()
         try:
             if self._cancelled:
                 return
@@ -397,6 +527,35 @@ class MaskProcessWorker(QObject):
                 return
             if processed is None:
                 raise RuntimeError("掩膜处理没有生成有效结果")
+            processed_mask = processed.get("processed_mask")
+            if not isinstance(processed_mask, np.ndarray):
+                raise RuntimeError("掩膜处理结果缺少有效掩膜")
+            from provenance import make_stage_record
+            from row_geometry import MASK_REGULARIZATION_VERSION
+            provenance_inputs = {
+                "inference_fingerprint": str(
+                    (getattr(self.state, "inference_provenance", {}) or {}).get("fingerprint", "")
+                ),
+                "raw_mask_sha256": str(
+                    (getattr(self.state, "inference_provenance", {}) or {}).get("artifact_sha256", "")
+                ),
+                "mask_config": {
+                    key: value for key, value in self.config.items()
+                    if not str(key).startswith("_")
+                },
+            }
+            processed["provenance"] = make_stage_record(
+                "mask",
+                MASK_REGULARIZATION_VERSION,
+                provenance_inputs,
+                processed_mask,
+            )
+            processed["runtime"] = {
+                "stage": "mask_processing",
+                "seconds": float(time.perf_counter() - started_at),
+                "input_shape": [int(value) for value in self.raw_mask.shape[:2]],
+                "input_nonzero_pixels": int(np.count_nonzero(self.raw_mask)),
+            }
             self.progress.emit(95, "掩膜处理完成，正在刷新界面...")
             self.finished.emit(processed)
         except Exception as e:
@@ -439,6 +598,7 @@ class PlanWorker(QObject):
         self.progress.emit(min(99, 20 + int(value * 0.75)), str(message or "路径规划中..."))
 
     def run(self):
+        started_at = time.perf_counter()
         try:
             if self._cancelled:
                 return
@@ -470,6 +630,38 @@ class PlanWorker(QObject):
             )
             if self._cancelled:
                 return
+            from config import Config
+            from path_planner import PATH_PLANNING_VERSION
+            from provenance import make_stage_record
+            path_config = Config().section("path_planning")
+            path_config.update({
+                key: value for key, value in self.config.items()
+                if not str(key).startswith("_") and key != "headland_mask"
+            })
+            path_inputs = {
+                "mask_fingerprint": str(
+                    (self.mask_result.get("provenance", {}) or {}).get("fingerprint", "")
+                ),
+                "path_config": path_config,
+                "harvester": dict(getattr(self.state, "harvester_params", {}) or {}),
+                "turn_strategy": str(getattr(self.state, "turn_strategy", "auto")),
+                "entry_point": getattr(self.state, "entry_point", None),
+                "exit_point": getattr(self.state, "exit_point", None),
+                "unload_points": list(getattr(self.state, "unload_points", []) or []),
+            }
+            path_artifact = {
+                "full_path": path_result.get("full_path", []),
+                "segment_types": path_result.get("segment_types", []),
+            }
+            path_result["provenance"] = make_stage_record(
+                "path", PATH_PLANNING_VERSION, path_inputs, path_artifact
+            )
+            path_result["runtime"] = {
+                "stage": "path_planning",
+                "seconds": float(time.perf_counter() - started_at),
+                "mask_shape": [int(value) for value in processed_mask.shape[:2]],
+                "band_count": len(wide_bands),
+            }
             self.progress.emit(98, "路径规划完成，正在刷新界面...")
             self.finished.emit({
                 "path": path_result,

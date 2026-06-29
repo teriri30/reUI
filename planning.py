@@ -3071,7 +3071,7 @@ def smooth_mask(mask: np.ndarray, geo=None, state=None) -> np.ndarray:
     """
     from row_geometry import regularize_crop_mask
 
-    config = dict(Config()._raw.get("mask_processing", {}))
+    config = Config().section("mask_processing")
     return regularize_crop_mask(
         mask,
         geo=geo,
@@ -3623,10 +3623,7 @@ def diagnose_mask_params(mask: np.ndarray, geo: GeoUtils, bands_truth: Optional[
         return None, None
 
     cfg = Config()
-    raw = cfg._raw.setdefault("path_planning", {})
-    model_raw = cfg._raw.setdefault("model", {})
-    old_area = raw.get("min_band_area_px", cfg.MIN_BAND_AREA_PX)
-
+    model_raw = cfg.section("model")
     base_area = max(200, int(cfg.MIN_BAND_AREA_PX))
     base_erode = max(0, int(model_raw.get("erode_kernel_size", cfg.ERODE_KERNEL_SIZE)))
     area_candidates = sorted({
@@ -3649,38 +3646,35 @@ def diagnose_mask_params(mask: np.ndarray, geo: GeoUtils, bands_truth: Optional[
     print(f"  erode_kernel candidates = {erode_candidates}")
     print(f"  min_band_area candidates = {area_candidates}")
 
-    try:
-        for kernel_size in erode_candidates:
-            if kernel_size > 0:
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-                work_mask = cv2.erode(mask, kernel, iterations=max(1, cfg.ERODE_ITERATIONS))
-            else:
-                work_mask = mask.copy()
+    for kernel_size in erode_candidates:
+        if kernel_size > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            work_mask = cv2.erode(mask, kernel, iterations=max(1, cfg.ERODE_ITERATIONS))
+        else:
+            work_mask = mask.copy()
 
-            for min_area in area_candidates:
-                raw["min_band_area_px"] = min_area
+        for min_area in area_candidates:
+            with cfg.temporary_section("path_planning", {"min_band_area_px": min_area}):
                 bands = BandExtractor(geo).extract(work_mask, None)
-                count = len(bands)
-                if count == 0:
-                    score = -1e9
-                    avg_aspect = 0.0
-                else:
-                    aspects = [b.length / max(1.0, b.width) for b in bands]
-                    avg_aspect = float(np.mean(aspects))
-                    score = count * 10.0 + avg_aspect
-                    if bands_truth is not None:
-                        score -= abs(count - bands_truth) * 100.0
+            count = len(bands)
+            if count == 0:
+                score = -1e9
+                avg_aspect = 0.0
+            else:
+                aspects = [b.length / max(1.0, b.width) for b in bands]
+                avg_aspect = float(np.mean(aspects))
+                score = count * 10.0 + avg_aspect
+                if bands_truth is not None:
+                    score -= abs(count - bands_truth) * 100.0
 
-                print(
-                    f"kernel={kernel_size:>2}, min_area={min_area:>5}, "
-                    f"bands={count:>3}, avg_aspect={avg_aspect:>5.2f}, score={score:>8.2f}"
-                )
+            print(
+                f"kernel={kernel_size:>2}, min_area={min_area:>5}, "
+                f"bands={count:>3}, avg_aspect={avg_aspect:>5.2f}, score={score:>8.2f}"
+            )
 
-                if score > best_score:
-                    best_score = score
-                    best = (kernel_size, min_area)
-    finally:
-        raw["min_band_area_px"] = old_area
+            if score > best_score:
+                best_score = score
+                best = (kernel_size, min_area)
 
     if best[0] is None:
         print("未找到有效参数组合。")

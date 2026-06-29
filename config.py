@@ -1,21 +1,89 @@
-"""配置管理 + 日志。注意：此模块不含任何 GUI 框架依赖，同时兼容 Tkinter 和 PySide6。"""
-import os, json, logging, datetime, tempfile, glob as _glob
+"""Configuration management and logging for the PySide6 application."""
+import os, json, logging, datetime, tempfile, glob as _glob, threading
+from contextlib import contextmanager
+from copy import deepcopy
 from typing import Any, Optional
 
-# ── Tkinter 兼容层（PySide6 版不导入 `_TK`，无需 tkinter）──
-try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
-    DND_AVAILABLE = True
-except ImportError:
-    TkinterDnD = None
-    DND_FILES = None
-    DND_AVAILABLE = False
 
-# Tkinter 全局根窗口引用（PySide6 版不使用，保留以兼容历史模块）
-# 使用列表容器确保跨模块引用同步更新
-# 用法: from config import _TK; root = _TK[0]
-_TK: list = [None]
+class ConfigValidationError(ValueError):
+    """Configuration is syntactically valid JSON but scientifically unsafe."""
 
+
+def _validated_number(section: dict, key: str, *, minimum=None, maximum=None, strict_min=False):
+    if key not in section:
+        return
+    value = section[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigValidationError(f"{key} must be a number")
+    value = float(value)
+    if minimum is not None and (value < minimum or (strict_min and value == minimum)):
+        op = ">" if strict_min else ">="
+        raise ConfigValidationError(f"{key} must be {op} {minimum}")
+    if maximum is not None and value > maximum:
+        raise ConfigValidationError(f"{key} must be <= {maximum}")
+
+
+def validate_config(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise ConfigValidationError("configuration root must be an object")
+    schema_version = str(raw.get("_schema_version", "1.1"))
+    if schema_version not in {"1.1", "1.2"}:
+        raise ConfigValidationError(f"unsupported _schema_version: {schema_version}")
+    for name in ("model", "harvester", "path_planning", "mask_processing", "raster_preprocessing", "geo"):
+        if name in raw and not isinstance(raw[name], dict):
+            raise ConfigValidationError(f"{name} must be an object")
+
+    model = raw.get("model", {})
+    _validated_number(model, "conf_threshold", minimum=0.0, maximum=1.0)
+    _validated_number(model, "iou_threshold", minimum=0.0, maximum=1.0)
+    _validated_number(model, "tile_overlap", minimum=0.0, maximum=0.95)
+    _validated_number(model, "tile_capture_size", minimum=64, maximum=8192)
+    _validated_number(model, "max_source_crop_pixels", minimum=1)
+
+    harvester = raw.get("harvester", {})
+    for key in (
+        "cutter_width_m", "track_width_m", "track_gauge_m", "wheelbase_m",
+        "track_length_m", "turn_radius_m",
+    ):
+        _validated_number(harvester, key, minimum=0.0, strict_min=True)
+    if "track_width_m" in harvester and "track_gauge_m" in harvester:
+        if float(harvester["track_width_m"]) >= float(harvester["track_gauge_m"]):
+            raise ConfigValidationError("track_width_m must be smaller than track_gauge_m")
+
+    planning = raw.get("path_planning", {})
+    _validated_number(planning, "min_turn_radius_m", minimum=0.0, strict_min=True)
+    _validated_number(planning, "planning_max_dim", minimum=256)
+    _validated_number(planning, "validation_max_dim", minimum=256)
+    for key in (
+        "max_track_core_overlap_pct", "min_harvest_coverage_pct",
+        "max_track_outside_field_pct",
+    ):
+        _validated_number(planning, key, minimum=0.0, maximum=100.0)
+
+    mask = raw.get("mask_processing", {})
+    if "strength" in mask and str(mask["strength"]) not in {
+        "light", "standard", "strong", "very_strong",
+    }:
+        raise ConfigValidationError("strength must be light, standard, strong, or very_strong")
+    _validated_number(mask, "max_work_dim", minimum=256)
+    _validated_number(mask, "band_width_threshold_m", minimum=0.0, strict_min=True)
+
+    raster = raw.get("raster_preprocessing", {})
+    if "mode" in raster and str(raster["mode"]) not in {
+        "percentile_per_band", "uint8_identity",
+    }:
+        raise ConfigValidationError("raster_preprocessing.mode is unsupported")
+    _validated_number(raster, "lower_percentile", minimum=0.0, maximum=100.0)
+    _validated_number(raster, "upper_percentile", minimum=0.0, maximum=100.0)
+    lower = float(raster.get("lower_percentile", 2.0))
+    upper = float(raster.get("upper_percentile", 98.0))
+    if lower >= upper:
+        raise ConfigValidationError("lower_percentile must be smaller than upper_percentile")
+
+    geo = raw.get("geo", {})
+    _validated_number(geo, "max_pixel_anisotropy_ratio", minimum=1.0)
+    _validated_number(geo, "max_gsd_variation_ratio", minimum=0.0, maximum=1.0)
+    return raw
 
 def save_json_atomic(path: str, data: dict):
     """原子写入 JSON 文件：先写临时文件再替换，防止写入中断导致文件损坏。
@@ -47,12 +115,15 @@ def save_json_atomic(path: str, data: dict):
 
 class Config:
     _instance = None
+    _instance_lock = threading.Lock()
 
     def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._loaded = False
-            cls._instance._raw = {}
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._loaded = False
+                cls._instance._raw = {}
+                cls._instance._lock = threading.RLock()
         return cls._instance
 
     def load(self, path: str = "") -> bool:
@@ -67,25 +138,74 @@ class Config:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
-                self._raw = raw
-                self._loaded = True
+                validated = validate_config(raw)
+                with self._lock:
+                    self._raw = validated
+                    self._loaded = True
                 return True
+            except ConfigValidationError:
+                with self._lock:
+                    self._raw = {}
+                    self._loaded = False
+                raise
             except Exception as e:
                 print(f"[Config] 加载配置文件失败: {e}")
-        self._raw = {}
-        self._loaded = False
+        with self._lock:
+            self._raw = {}
+            self._loaded = False
         return False
 
     def _get(self, *keys: str, default: Any = None) -> Any:
-        val = self._raw
-        for k in keys:
-            if isinstance(val, dict):
-                val = val.get(k)
-                if val is None:
+        with self._lock:
+            val = self._raw
+            for k in keys:
+                if isinstance(val, dict):
+                    val = val.get(k)
+                    if val is None:
+                        return default
+                else:
                     return default
-            else:
-                return default
-        return val if val is not None else default
+            return val if val is not None else default
+
+    def section(self, name: str) -> dict:
+        with self._lock:
+            value = self._raw.get(str(name), {})
+            return deepcopy(value) if isinstance(value, dict) else {}
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return deepcopy(self._raw)
+
+    def replace(self, raw: dict) -> dict:
+        candidate = validate_config(deepcopy(raw))
+        with self._lock:
+            self._raw = candidate
+            self._loaded = True
+            return deepcopy(self._raw)
+
+    def update_section(self, name: str, updates: dict) -> dict:
+        with self._lock:
+            candidate = deepcopy(self._raw)
+            section = candidate.setdefault(str(name), {})
+            if not isinstance(section, dict):
+                raise ConfigValidationError(f"{name} must be an object")
+            section.update(deepcopy(updates or {}))
+            validate_config(candidate)
+            self._raw = candidate
+            return deepcopy(self._raw)
+
+    @contextmanager
+    def temporary_section(self, name: str, updates: dict):
+        with self._lock:
+            original = deepcopy(self._raw)
+            candidate = deepcopy(self._raw)
+            candidate.setdefault(str(name), {}).update(deepcopy(updates or {}))
+            validate_config(candidate)
+            self._raw = candidate
+            try:
+                yield
+            finally:
+                self._raw = original
 
     @property
     def WIN_W(self) -> int: return self._get("window", "width", default=1500)
@@ -124,7 +244,7 @@ class Config:
     def TILE_OVERLAP(self) -> float: return self._get("model", "tile_overlap", default=0.4)
     @property
     def TILE_CAPTURE_SIZE(self) -> int:
-        return self._get("model", "tile_capture_size", default=4096)
+        return self._get("model", "tile_capture_size", default=640)
 
     @property
     def ERODE_KERNEL_SIZE(self) -> int:

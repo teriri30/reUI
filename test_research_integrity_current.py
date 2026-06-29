@@ -1,0 +1,275 @@
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("REUI_DISABLE_AUTO_START", "1")
+
+import numpy as np
+import pytest
+
+
+def test_missing_config_uses_native_640_capture_size():
+    from config import Config
+
+    cfg = Config()
+    previous_raw = dict(getattr(cfg, "_raw", {}))
+    previous_loaded = getattr(cfg, "_loaded", False)
+    try:
+        cfg._raw = {}
+        cfg._loaded = False
+        assert cfg.TILE_CAPTURE_SIZE == 640
+    finally:
+        cfg._raw = previous_raw
+        cfg._loaded = previous_loaded
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ({"model": {"tile_overlap": 1.0}}, "tile_overlap"),
+        ({"model": {"conf_threshold": -0.1}}, "conf_threshold"),
+        ({"harvester": {"track_width_m": 0.8, "track_gauge_m": 0.5}}, "track_width_m"),
+        ({"mask_processing": {"strength": "unknown"}}, "strength"),
+    ],
+)
+def test_invalid_scientific_config_is_rejected(payload, message):
+    from config import ConfigValidationError, validate_config
+
+    with pytest.raises(ConfigValidationError, match=message):
+        validate_config(payload)
+
+
+def test_stage_record_rejects_changed_model_or_artifact(tmp_path):
+    from provenance import ProvenanceError, array_sha256, file_sha256, make_stage_record, verify_stage_record
+
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"model-a")
+    mask = np.arange(16, dtype=np.uint8).reshape(4, 4)
+    inputs = {"model_sha256": file_sha256(model), "conf": 0.25}
+    record = make_stage_record("inference", "inference-v1", inputs, mask)
+
+    assert verify_stage_record(record, "inference", inputs, mask)
+    assert record["artifact_sha256"] == array_sha256(mask)
+
+    model.write_bytes(b"model-b")
+    changed_inputs = {"model_sha256": file_sha256(model), "conf": 0.25}
+    with pytest.raises(ProvenanceError, match="input fingerprint"):
+        verify_stage_record(record, "inference", changed_inputs, mask)
+
+    changed_mask = mask.copy()
+    changed_mask[0, 0] = 255
+    with pytest.raises(ProvenanceError, match="artifact hash"):
+        verify_stage_record(record, "inference", inputs, changed_mask)
+
+
+def test_mask_stage_record_rejects_any_parameter_change():
+    from provenance import ProvenanceError, make_stage_record, verify_stage_record
+
+    mask = np.ones((8, 8), dtype=np.uint8)
+    inputs = {
+        "inference_fingerprint": "abc",
+        "config": {"strength": "standard", "band_width_threshold_m": 0.55},
+    }
+    record = make_stage_record("mask", "mask-v1", inputs, mask)
+    changed = {
+        "inference_fingerprint": "abc",
+        "config": {"strength": "standard", "band_width_threshold_m": 0.65},
+    }
+
+    with pytest.raises(ProvenanceError, match="input fingerprint"):
+        verify_stage_record(record, "mask", changed, mask)
+
+
+def test_uint16_preprocessing_is_per_band_deterministic_and_masks_nodata():
+    from raster_preprocessing import RASTER_PREPROCESSING_VERSION, normalise_raster_bands
+
+    bands = np.array(
+        [
+            [[0, 100, 200], [300, 400, 65535]],
+            [[0, 1000, 2000], [3000, 4000, 65535]],
+            [[0, 10, 20], [30, 40, 65535]],
+        ],
+        dtype=np.uint16,
+    )
+    valid = np.ones_like(bands, dtype=np.uint8) * 255
+    valid[:, 1, 2] = 0
+    config = {"mode": "percentile_per_band", "lower_percentile": 0.0, "upper_percentile": 100.0}
+
+    first, metadata = normalise_raster_bands(bands, valid, config)
+    second, metadata_again = normalise_raster_bands(bands, valid, config)
+
+    assert first.dtype == np.uint8
+    assert first.shape == (2, 3, 3)
+    assert np.array_equal(first, second)
+    assert np.all(first[1, 2] == 0)
+    assert metadata == metadata_again
+    assert metadata["version"] == RASTER_PREPROCESSING_VERSION
+    assert [item["upper"] for item in metadata["bands"]] == [400.0, 4000.0, 40.0]
+
+
+def test_legacy_export_engine_is_fail_closed(tmp_path):
+    from export import ExportEngine
+    from state import AppState
+
+    state = AppState()
+    state.path_points = [(0.0, 0.0), (1.0, 1.0)]
+    state.path_status = [1, 1]
+
+    with pytest.raises(RuntimeError, match="已禁用"):
+        ExportEngine(object(), state).export_to_file(str(tmp_path / "unsafe.path"))
+
+
+def test_cache_restore_rejects_old_mask_when_model_file_changes(tmp_path, monkeypatch):
+    import cache
+    from config import Config
+    from model import INFERENCE_PIPELINE_VERSION
+    from provenance import file_sha256, make_stage_record
+    from pyside6_app.workers import CacheRestoreWorker
+    from state import AppState
+
+    monkeypatch.setattr(cache, "CACHE_ROOT", str(tmp_path / "cache"))
+    source = tmp_path / "field.tif"
+    source.write_bytes(b"geotiff-source")
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"model-a")
+    raw_mask = np.ones((6, 6), dtype=np.uint8)
+    cfg = Config()
+    inputs = {
+        "source_sha256": file_sha256(source),
+        "model_sha256": file_sha256(model),
+        "field_boundary": [[0.0, 0.0], [5.0, 0.0], [5.0, 5.0]],
+        "inference_config": {
+            "capture_size": int(cfg.TILE_CAPTURE_SIZE),
+            "overlap": float(cfg.TILE_OVERLAP),
+            "conf": float(cfg.MODEL_CONF),
+            "iou": float(cfg.MODEL_IOU),
+            "batch_size": 4,
+        },
+        "preprocessing_config": cfg.section("raster_preprocessing"),
+    }
+    record = make_stage_record(
+        "inference", INFERENCE_PIPELINE_VERSION, inputs, raw_mask
+    )
+    state = AppState()
+    state.safe_update(
+        tif_path=str(source),
+        source_sha256=file_sha256(source),
+        current_model_path=str(model),
+        current_model_name=model.name,
+        model_sha256=file_sha256(model),
+        field_boundary=inputs["field_boundary"],
+        inference_done=True,
+        inference_provenance=record,
+    )
+    cache.save_mask(str(source), raw_mask)
+    cache.save_project_state(str(source), state, stage="inference")
+
+    model.write_bytes(b"model-b")
+    results = []
+    worker = CacheRestoreWorker(str(source), expected_source_sha256=file_sha256(source))
+    worker.finished.connect(results.append)
+    worker.run()
+
+    assert results[0]["saved"]["inference_done"] is False
+    assert results[0]["raw_mask"] is None
+    assert any("AI 掩膜缓存失效" in item for item in results[0]["cache_validation_messages"])
+
+
+def test_cache_loader_never_reuses_same_shape_mask_from_another_source(tmp_path, monkeypatch):
+    import cache
+
+    monkeypatch.setattr(cache, "CACHE_ROOT", str(tmp_path / "cache"))
+    first = tmp_path / "first.tif"
+    second = tmp_path / "second.tif"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    cache.save_mask(str(first), np.ones((10, 10), dtype=np.uint8))
+
+    assert cache.load_preferred_cache(str(second), image_shape=(10, 10)) is None
+
+
+def test_metric_processing_rejects_anisotropic_raster_pixels():
+    from pyside6_app.workers import require_metric_scale
+
+    class AnisotropicGeo:
+        def is_ready(self):
+            return True
+
+        def meters_per_pixel(self, _x, _y):
+            return 0.02
+
+        def pixel_distance_m(self, first, second):
+            if second[0] != first[0]:
+                return 0.01
+            return 0.03
+
+    state = type("State", (), {"mask_offset_x": 0, "mask_offset_y": 0})()
+    with pytest.raises(RuntimeError, match="横纵尺度差异过大"):
+        require_metric_scale(AnisotropicGeo(), state, (100, 100))
+
+
+def test_builtin_model_registry_matches_present_weight_files():
+    import json
+    from pathlib import Path
+    from provenance import file_sha256
+
+    model_dir = Path(__file__).with_name("data") / "models"
+    registry = json.loads((model_dir / "model_registry.json").read_text(encoding="utf-8"))
+    assert registry["schema"] == 1
+    for item in registry["models"]:
+        weight = model_dir / item["name"]
+        if weight.exists():
+            assert file_sha256(weight) == item["sha256"]
+
+
+def test_provenance_canonical_json_normalises_nonfinite_metadata():
+    from provenance import canonical_json_bytes
+
+    encoded = canonical_json_bytes({"nodata": np.float32(np.nan)})
+    assert encoded == b'{"nodata":null}'
+
+
+def test_offline_manifest_checker_detects_route_tampering(tmp_path):
+    import json
+    from integrity_check import verify_manifest
+    from provenance import file_sha256, make_stage_record
+
+    output = tmp_path / "route.csv"
+    output.write_text("lon,lat\n120,30\n", encoding="utf-8")
+    record = make_stage_record(
+        "inference", "v1", {"input": "fixed"}, np.ones((2, 2), dtype=np.uint8)
+    )
+    mask_record = make_stage_record("mask", "v1", {"input": "fixed"}, {"mask": 1})
+    path_record = make_stage_record("path", "v1", {"input": "fixed"}, {"path": 1})
+    manifest = {
+        "output": {"path": str(output), "sha256": file_sha256(output)},
+        "analysis": {"stage_provenance": {
+            "inference": record,
+            "mask": mask_record,
+            "path": path_record,
+        }},
+    }
+    manifest_path = tmp_path / "route.csv.manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert verify_manifest(manifest_path) == []
+    output.write_text("lon,lat\n0,0\n", encoding="utf-8")
+    assert "output SHA-256 does not match manifest" in verify_manifest(manifest_path)
+
+
+def test_config_updates_are_atomic_and_temporary_overrides_are_restored():
+    from config import Config, ConfigValidationError
+
+    cfg = Config()
+    original = cfg.snapshot()
+    try:
+        with pytest.raises(ConfigValidationError):
+            cfg.update_section("model", {"tile_overlap": 1.0})
+        assert cfg.snapshot() == original
+
+        with pytest.raises(RuntimeError):
+            with cfg.temporary_section("model", {"tile_overlap": 0.2}):
+                assert cfg.TILE_OVERLAP == 0.2
+                raise RuntimeError("stop")
+        assert cfg.snapshot() == original
+    finally:
+        cfg.replace(original)

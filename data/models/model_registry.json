@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "models": [
+    {
+      "name": "yolo11m_seg_best.pt",
+      "sha256": "93afb1ba0492266e22b9f1e16811cc31a28f52ac48c53bd46e0ddc740ea520ad",
+      "reported_metrics": {"mAP50": 0.9355},
+      "training_dataset_version": "NOT_RECORDED",
+      "class_mapping": "NOT_RECORDED",
+      "training_preprocessing": "NOT_RECORDED"
+    },
+    {
+      "name": "yolo11s_seg_best.pt",
+      "sha256": "3268e61f4f0e0975806124f3aa7202eb881529ee0cd6f6e5b42e18bd5598372c",
+      "reported_metrics": {"mAP50": 0.9416},
+      "training_dataset_version": "NOT_RECORDED",
+      "class_mapping": "NOT_RECORDED",
+      "training_preprocessing": "NOT_RECORDED"
+    },
+    {
+      "name": "yolov8s_seg_best.pt",
+      "sha256": "103c2eadd2e6240819319b81f046549faaffa0f949368ec1d339e565241617b2",
+      "reported_metrics": {"mAP50": 0.9396},
+      "training_dataset_version": "NOT_RECORDED",
+      "class_mapping": "NOT_RECORDED",
+      "training_preprocessing": "NOT_RECORDED"
+    }
+  ]
+}

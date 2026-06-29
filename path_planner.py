@@ -16,6 +16,9 @@ from footprint_planner import generate_work_lines, validate_footprints
 from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
 
 
+PATH_PLANNING_VERSION = "footprint-path-v1"
+
+
 def build_band_mask(shape, bands: List[Dict]) -> np.ndarray:
     """Build a planning-only mask without modifying the optimized crop mask."""
     mask = np.zeros(shape[:2], dtype=np.uint8)
@@ -329,7 +332,7 @@ def _turn_point_count(
     mpp: float,
     minimum: int,
 ) -> int:
-    config = Config()._raw.get("path_planning", {})
+    config = Config().section("path_planning")
     interval_m = float(config.get("turn_point_interval_m", 0.25))
     interval_px = max(2.0, interval_m / max(mpp, 1e-6))
     return max(minimum, int(math.ceil(arc_length_px / interval_px)))

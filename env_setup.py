@@ -6,12 +6,17 @@ env_setup.py — 环境自检 + 一键安装模块
 检测核心依赖是否齐全，缺失时弹出 tkinter 对话框让用户一键安装。
 """
 import importlib
+from importlib import metadata
 import os
 import subprocess
 import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
+from runtime_env import configure_geospatial_environment
+
+
+configure_geospatial_environment()
 
 PIP_INSTALL_TIMEOUT_SECONDS = int(os.environ.get("REUI_PIP_TIMEOUT_SECONDS", "1800"))
 
@@ -19,14 +24,16 @@ PIP_INSTALL_TIMEOUT_SECONDS = int(os.environ.get("REUI_PIP_TIMEOUT_SECONDS", "18
 # (显示名, import模块名, pip包名, conda包名)
 # conda_package=None 表示仅 pip 可用
 DEPENDENCIES = [
-    ("NumPy",        "numpy",        "numpy>=1.21.0",        "numpy"),
-    ("OpenCV",       "cv2",          "opencv-python>=4.5.0", "opencv"),
-    ("Pillow",       "PIL",          "Pillow>=9.0.0",        "pillow"),
-    ("PyProj",       "pyproj",       "pyproj>=3.3.0",        "pyproj"),
-    ("Rasterio",     "rasterio",     "rasterio>=1.3.0",      "rasterio"),
-    ("Shapely",      "shapely",      "shapely>=2.0.0",        "shapely"),
-    ("Ultralytics",  "ultralytics",  "ultralytics>=8.1.0",    None),
-    ("TkinterDnD2",  "tkinterdnd2",  "tkinterdnd2>=0.3.0",   None),
+    ("NumPy",        "numpy",        "numpy==2.2.6",           "numpy"),
+    ("OpenCV",       "cv2",          "opencv-python==4.13.0.92", "opencv"),
+    ("Pillow",       "PIL",          "Pillow==12.1.1",         "pillow"),
+    ("PySide6",      "PySide6",      "PySide6==6.11.1",       None),
+    ("PyProj",       "pyproj",       "pyproj==3.7.1",         "pyproj"),
+    ("Rasterio",     "rasterio",     "rasterio==1.4.4",       "rasterio"),
+    ("Shapely",      "shapely",      "shapely==2.1.2",        "shapely"),
+    ("Affine",       "affine",       "affine==2.4.0",         "affine"),
+    ("SciPy",        "scipy",        "scipy==1.15.3",         "scipy"),
+    ("Ultralytics",  "ultralytics",  "ultralytics==8.3.163",  None),
 ]
 
 
@@ -36,7 +43,14 @@ def check_missing() -> list:
     for name, import_name, pip_pkg, conda_pkg in DEPENDENCIES:
         try:
             importlib.import_module(import_name)
+            if "==" in pip_pkg:
+                distribution, expected = pip_pkg.split("==", 1)
+                installed = metadata.version(distribution)
+                if installed != expected:
+                    missing.append((name, import_name, pip_pkg, conda_pkg))
         except ImportError:
+            missing.append((name, import_name, pip_pkg, conda_pkg))
+        except metadata.PackageNotFoundError:
             missing.append((name, import_name, pip_pkg, conda_pkg))
     return missing
 
@@ -344,11 +358,6 @@ class EnvSetupDialog(tk.Toplevel):
         self._hint_label.configure(
             text="✅ 环境已就绪！点击「启动程序」继续",
             foreground="green", font=("", 9, "bold"))
-
-        # 提示 TkinterDnD2 需要重启
-        tkdnd_missing = any(info[1] == "tkinterdnd2" for info in self._checkboxes.values())
-        if tkdnd_missing and self._install_success:
-            self._log_write("\n💡 提示: TkinterDnD2 安装后需重启程序才能生效\n")
 
     # ── 按钮事件 ──
 

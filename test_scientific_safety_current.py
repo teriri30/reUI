@@ -242,6 +242,7 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
         "validation": {"valid": True, "issues": []},
         "planning_factors": {"harvester": {"track_width_m": 0.45}},
     }
+    window.state.source_sha256 = "test-source-sha256"
 
     manifest_path = window._write_export_manifest(
         str(output), "CSV", path_result, points
@@ -250,6 +251,10 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
 
     assert manifest["output"]["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
     assert manifest["analysis"]["validation"]["valid"] is True
+    assert manifest["application_version"]
+    assert manifest["scientific_code"]["fingerprint"]
+    assert manifest["source_image"]["sha256"] == "test-source-sha256"
+    assert set(manifest["analysis"]["stage_provenance"]) == {"inference", "mask", "path"}
     assert manifest["integrity"]["config_sha256"]
     assert manifest["integrity"]["route_data_sha256"]
 

@@ -312,7 +312,7 @@ class SettingsDialog(QDialog):
         self.spin_iou = QDoubleSpinBox(); self.spin_iou.setRange(0.01, 0.99); self.spin_iou.setSingleStep(0.05)
         self.spin_iou.setValue(self._config.get("model", {}).get("iou_threshold", 0.45))
         self.spin_tile = QSpinBox(); self.spin_tile.setRange(256, 2048); self.spin_tile.setSingleStep(64)
-        self.spin_tile.setSuffix(" px"); self.spin_tile.setValue(self._config.get("model", {}).get("tile_size", 640))
+        self.spin_tile.setSuffix(" px"); self.spin_tile.setValue(self._config.get("model", {}).get("tile_capture_size", 640))
         f.addRow("置信度阈值:", self.spin_conf)
         f.addRow("IOU 阈值:", self.spin_iou)
         f.addRow("切片大小:", self.spin_tile)
@@ -355,7 +355,7 @@ class SettingsDialog(QDialog):
     def _save(self):
         self._config.setdefault("model", {})["conf_threshold"] = self.spin_conf.value()
         self._config.setdefault("model", {})["iou_threshold"] = self.spin_iou.value()
-        self._config.setdefault("model", {})["tile_size"] = self.spin_tile.value()
+        self._config.setdefault("model", {})["tile_capture_size"] = self.spin_tile.value()
         self._config.setdefault("path_planning", {})["path_point_interval_m"] = self.spin_interval.value()
         self._config.setdefault("path_planning", {})["headland_buffer_m"] = self.spin_buffer.value()
         self._config.setdefault("mask_processing", {})["strength"] = self.combo_strength.currentData() or "standard"

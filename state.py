@@ -65,6 +65,9 @@ class AppState:
         self.downsample_factor: int = 1  # 降采样倍率
         self.display_scale_x: float = 1.0  # 原图宽度 / 显示宽度
         self.display_scale_y: float = 1.0  # 原图高度 / 显示高度
+        self.source_sha256: str = ""
+        self.source_metadata: Dict[str, Any] = {}
+        self.raster_preprocessing: Dict[str, Any] = {}
 
         self.view_scale: float = 1.0
         self.view_x: float = 0.0
@@ -100,16 +103,21 @@ class AppState:
         self.inference_done: bool = False
         self.inference_running: bool = False
         self.inference_progress: float = 0.0
+        self.inference_provenance: Dict[str, Any] = {}
+        self.inference_runtime: Dict[str, Any] = {}
 
         # 掩膜处理状态
         self.mask_processed: bool = False         # 掩膜处理是否完成
         self.mask_processing_running: bool = False
         self.mask_processing_progress: float = 0.0  # 0.0~1.0
         self.mask_result: Optional[Dict] = None   # process_mask() 返回的完整结果
+        self.mask_provenance: Dict[str, Any] = {}
 
         # 路径规划进度
         self.plan_running: bool = False
         self.plan_progress: float = 0.0             # 0.0~1.0
+        self.path_provenance: Dict[str, Any] = {}
+        self.path_runtime: Dict[str, Any] = {}
 
         self.smooth_running: bool = False
         self.smooth_progress: float = 0.0
@@ -191,6 +199,7 @@ class AppState:
         self.model_eval_scores: Dict = {}
         self.current_model_name: str = ""      # 当前加载的模型名
         self.current_model_path: str = ""      # 当前加载的模型完整路径
+        self.model_sha256: str = ""
         self.model_dropdown_open: bool = False  # 模型下拉菜单是否展开
         self.model_dropdown_rect = None         # 下拉菜单按钮的 hitbox（x1,y1,x2,y2）
         self.model_dropdown_items: List[Dict] = []  # 下拉菜单项 [{name, path, is_import}]

@@ -1,5 +1,6 @@
 """项目缓存：保存影像对应的完整工作状态，支持跨会话继续处理。"""
 import os, json, hashlib, datetime
+import math
 import threading
 import time
 import uuid
@@ -8,7 +9,7 @@ from typing import Optional, Tuple, Dict, Any
 import numpy as np
 
 CACHE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hillcache")
-PROJECT_STATE_SCHEMA = 4
+PROJECT_STATE_SCHEMA = 5
 _PROJECT_LOCKS = {}
 _PROJECT_LOCKS_GUARD = threading.Lock()
 _PENDING_STATE_SAVES = {}
@@ -176,11 +177,13 @@ def _jsonable(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):
-        return value.item()
+        return _jsonable(value.item())
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
@@ -216,9 +219,17 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
             ],
         })
 
+    source_sha256 = str(getattr(state, "source_sha256", "") or "")
+    if not source_sha256 and os.path.isfile(tif_path):
+        from provenance import file_sha256
+        source_sha256 = file_sha256(tif_path)
+
     payload = {
         "schema": PROJECT_STATE_SCHEMA,
         "source_identity": source_identity(tif_path),
+        "source_sha256": source_sha256,
+        "source_metadata": _jsonable(getattr(state, "source_metadata", {}) or {}),
+        "raster_preprocessing": _jsonable(getattr(state, "raster_preprocessing", {}) or {}),
         "saved_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "stage": str(stage or ""),
         "tif_path": os.path.abspath(tif_path),
@@ -226,11 +237,15 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "field_area_m2": float(getattr(state, "field_area_m2", 0.0) or 0.0),
         "current_model_name": str(getattr(state, "current_model_name", "") or ""),
         "current_model_path": str(getattr(state, "current_model_path", "") or ""),
+        "model_sha256": str(getattr(state, "model_sha256", "") or ""),
+        "inference_provenance": _jsonable(getattr(state, "inference_provenance", {}) or {}),
+        "inference_runtime": _jsonable(getattr(state, "inference_runtime", {}) or {}),
         "inference_done": bool(getattr(state, "inference_done", False)),
         "mask_processed": bool(getattr(state, "mask_processed", False)),
         "mask_offset_x": int(getattr(state, "mask_offset_x", 0)),
         "mask_offset_y": int(getattr(state, "mask_offset_y", 0)),
         "mask_result": _mask_result_summary(getattr(state, "mask_result", None)),
+        "mask_provenance": _jsonable(getattr(state, "mask_provenance", {}) or {}),
         "harvester_params": _jsonable(getattr(state, "harvester_params", {})),
         "turn_strategy": str(getattr(state, "turn_strategy", "bow") or "bow"),
         "entry_point": _jsonable(getattr(state, "entry_point", None)),
@@ -248,6 +263,8 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "auto_path_planned": bool(getattr(state, "auto_path_planned", False)),
         "auto_path_valid": bool(getattr(state, "auto_path_valid", False)),
         "auto_path_desc": str(getattr(state, "auto_path_desc", "") or ""),
+        "path_provenance": _jsonable(getattr(state, "path_provenance", {}) or {}),
+        "path_runtime": _jsonable(getattr(state, "path_runtime", {}) or {}),
         "auto_path": auto_path,
         "auto_path_geo": _jsonable(getattr(state, "auto_path_geo", [])),
         "path_points": _jsonable(getattr(state, "path_points", [])),
@@ -354,7 +371,7 @@ def wait_for_project_state_saves(tif_path: str = "", timeout: float = 10.0) -> b
     return False
 
 
-def load_project_state(tif_path: str) -> Dict[str, Any]:
+def load_project_state(tif_path: str, expected_source_sha256: str = "") -> Dict[str, Any]:
     """Load a full project snapshot. Invalid/old snapshots fail closed."""
     path = _project_state_path(tif_path)
     if not os.path.exists(path):
@@ -368,6 +385,16 @@ def load_project_state(tif_path: str) -> Dict[str, Any]:
         saved_identity = payload.get("source_identity") or {}
         current_identity = source_identity(tif_path)
         if not saved_identity or saved_identity != current_identity:
+            return {}
+        saved_source_sha256 = str(payload.get("source_sha256", "") or "")
+        if not saved_source_sha256:
+            return {}
+        if expected_source_sha256:
+            current_source_sha256 = str(expected_source_sha256)
+        else:
+            from provenance import file_sha256
+            current_source_sha256 = file_sha256(tif_path)
+        if saved_source_sha256 != current_source_sha256:
             return {}
         return payload
     except Exception:
@@ -441,59 +468,13 @@ def _load_payload(mask_path: str, cache_dir: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _load_compatible_cache(image_shape: Tuple[int, int]) -> Optional[Dict[str, Any]]:
-    """兼容加载历史缓存：用于路径字符串变化后仍可按图幅尺寸恢复旧掩码。"""
-    if not os.path.isdir(CACHE_ROOT):
-        return None
-
-    best_score = None
-    best_payload = None
-    target_h, target_w = image_shape
-
-    for dirname in os.listdir(CACHE_ROOT):
-        d = os.path.join(CACHE_ROOT, dirname)
-        if not os.path.isdir(d):
-            continue
-        for suffix in ("_best", ""):
-            p = os.path.join(d, f"mask{suffix}.npz")
-            if not os.path.exists(p):
-                continue
-            payload = _load_payload(p, d)
-            if payload is None:
-                continue
-            mask = payload["mask"]
-            ox = payload["offset_x"]
-            oy = payload["offset_y"]
-            meta = payload.get("meta") or {}
-
-            mh, mw = mask.shape[:2]
-            full_match = (mh == target_h and mw == target_w and ox == 0 and oy == 0)
-            crop_match = (ox >= 0 and oy >= 0 and oy + mh <= target_h and ox + mw <= target_w)
-            if not full_match and not crop_match:
-                continue
-
-            score = (
-                2 if full_match else 1,
-                1 if suffix == "_best" else 0,
-                1 if meta.get("field_boundary") else 0,
-                int(np.count_nonzero(mask)),
-            )
-            if best_score is None or score > best_score:
-                best_score = score
-                best_payload = payload
-
-    return best_payload
-
-
 def load_preferred_cache(tif_path: str,
                          image_shape: Optional[Tuple[int, int]] = None) -> Optional[Dict[str, Any]]:
-    """优先加载历史最佳缓存；若不存在则回退到默认缓存或兼容缓存。"""
+    """Load only caches bound to the exact source path; never match by shape."""
     if has_cache(tif_path, suffix="_best"):
         return _load_payload(_mask_path(tif_path, "_best"), _cache_dir(tif_path))
     if has_cache(tif_path):
         return _load_payload(_mask_path(tif_path), _cache_dir(tif_path))
-    if image_shape is not None:
-        return _load_compatible_cache(image_shape)
     return None
 
 

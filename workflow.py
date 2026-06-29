@@ -102,7 +102,7 @@ class AnimationEngine:
     def max_speed_multiplier(self) -> float:
         return max(
             5.0,
-            float(self.cfg._raw.get("animation", {}).get(
+            float(self.cfg.section("animation").get(
                 "max_speed_multiplier", 60.0
             )),
         )
@@ -401,7 +401,7 @@ class AnimationEngine:
 
         heading_window_m = max(
             0.12,
-            float(self.cfg._raw.get("animation", {}).get(
+            float(self.cfg.section("animation").get(
                 "heading_window_m", 0.30
             )),
         )
@@ -442,7 +442,7 @@ class AnimationEngine:
         )
         icr_factor = max(
             0.5,
-            float(self.cfg._raw.get("animation", {}).get(
+            float(self.cfg.section("animation").get(
                 "track_icr_factor", 1.0
             )),
         )

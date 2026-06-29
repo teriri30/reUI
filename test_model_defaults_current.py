@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 EXPECTED_MODEL_DEFAULTS = {
+    "capture_size": 640,
     "overlap": 0.40,
     "conf": 0.25,
     "iou": 0.45,
@@ -14,6 +15,7 @@ def test_tiled_inference_defaults_match_run_documentation():
     from model import TiledInference
 
     signature = inspect.signature(TiledInference.run)
+    assert signature.parameters["capture_sz"].default == EXPECTED_MODEL_DEFAULTS["capture_size"]
     assert signature.parameters["overlap"].default == EXPECTED_MODEL_DEFAULTS["overlap"]
     assert signature.parameters["conf"].default == EXPECTED_MODEL_DEFAULTS["conf"]
     assert signature.parameters["iou"].default == EXPECTED_MODEL_DEFAULTS["iou"]
@@ -42,6 +44,7 @@ def test_config_defaults_match_model_defaults_when_config_file_is_missing():
     try:
         cfg._raw = {}
         cfg._loaded = False
+        assert cfg.TILE_CAPTURE_SIZE == EXPECTED_MODEL_DEFAULTS["capture_size"]
         assert cfg.TILE_OVERLAP == EXPECTED_MODEL_DEFAULTS["overlap"]
         assert cfg.MODEL_CONF == EXPECTED_MODEL_DEFAULTS["conf"]
         assert cfg.MODEL_IOU == EXPECTED_MODEL_DEFAULTS["iou"]
@@ -55,6 +58,7 @@ def test_config_json_model_defaults_match_code_defaults():
     config = json.loads(config_path.read_text(encoding="utf-8"))
     model_config = config["model"]
 
+    assert model_config["tile_capture_size"] == EXPECTED_MODEL_DEFAULTS["capture_size"]
     assert model_config["tile_overlap"] == EXPECTED_MODEL_DEFAULTS["overlap"]
     assert model_config["conf_threshold"] == EXPECTED_MODEL_DEFAULTS["conf"]
     assert model_config["iou_threshold"] == EXPECTED_MODEL_DEFAULTS["iou"]
