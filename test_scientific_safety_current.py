@@ -1,0 +1,270 @@
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("REUI_DISABLE_AUTO_START", "1")
+
+import numpy as np
+import pytest
+from PySide6.QtWidgets import QApplication
+
+
+class _NoGeo:
+    def is_ready(self):
+        return False
+
+
+class _MetricGeo:
+    def is_ready(self):
+        return True
+
+    def meters_per_pixel(self, _x, _y):
+        return 0.01
+
+    def pixel_to_lonlat(self, x, y):
+        return 120.0 + float(x) * 1e-6, 30.0 + float(y) * 1e-6
+
+    def pixel_distance_m(self, first, second):
+        return float(np.hypot(second[0] - first[0], second[1] - first[1])) * 0.01
+
+
+def test_metric_mask_pipeline_failure_is_not_silently_downgraded(monkeypatch):
+    import mask_processor
+
+    monkeypatch.setattr(
+        mask_processor,
+        "regularize_crop_mask",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("metric failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="metric failure"):
+        mask_processor.process_mask(
+            np.ones((20, 20), dtype=np.uint8) * 255,
+            geo=_MetricGeo(),
+            state=type("State", (), {"mask_offset_x": 0, "mask_offset_y": 0})(),
+            config={"strength": "standard"},
+        )
+
+
+def test_failed_rerun_cannot_mark_old_mask_as_new_success(monkeypatch, tmp_path):
+    import model
+    import rasterio
+    from state import AppState
+
+    class ImmediateThread:
+        def __init__(self, target, args=(), daemon=None, **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    class Engine:
+        def is_loaded(self):
+            return True
+
+    monkeypatch.setattr(model.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(rasterio, "open", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("read failed")))
+
+    state = AppState()
+    state.mask_raw = np.ones((4, 4), dtype=np.uint8)
+    state.inference_done = True
+    state.field_boundary = [(0, 0), (3, 0), (3, 3), (0, 3)]
+    runner = model.InferenceRunner(state, Engine(), _MetricGeo())
+
+    runner.start_from_tif(str(tmp_path / "broken.tif"), (4, 4), state.field_boundary, 1)
+
+    assert state.mask_raw is None
+    assert state.inference_done is False
+    assert state.inference_running is False
+
+
+def test_failed_inference_tile_aborts_instead_of_becoming_background():
+    from model import TiledInference
+
+    class FailingEngine:
+        def is_loaded(self):
+            return True
+
+        def predict(self, *_args, **_kwargs):
+            return None
+
+    with pytest.raises(RuntimeError, match="tile inference failed"):
+        TiledInference(FailingEngine()).run(
+            np.zeros((20, 20, 3), dtype=np.uint8),
+            capture_sz=16,
+            overlap=0.25,
+            batch_size=2,
+        )
+
+
+def test_route_info_theme_refresh_does_not_call_task_panel_methods():
+    from pyside6_app.panels import RouteInfoPanel
+
+    app = QApplication.instance() or QApplication([])
+    panel = RouteInfoPanel()
+    panel.update_route({"tracks": [{"points": [(0, 0), (1, 0)]}], "turns": []})
+
+    panel.refresh_theme()
+
+    assert panel._summary.text().startswith("作业线 1")
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_invalid_or_manually_edited_path_is_blocked_from_export():
+    from pyside6_app.main_window import MainWindow
+
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.geo = _MetricGeo()
+    window._pipeline_result = {
+        "path": {
+            "full_path": [[(1.0, 1.0), (2.0, 2.0)]],
+            "segment_types": ["work"],
+            "validation": {"valid": False, "issues": ["manual edit"]},
+            "is_valid": False,
+        }
+    }
+
+    with pytest.raises(ValueError, match="未通过安全验证"):
+        window._geo_export_payload()
+
+
+def test_metric_processing_requires_valid_georeference():
+    from pyside6_app.workers import require_metric_scale
+    from state import AppState
+
+    with pytest.raises(RuntimeError, match="有效地理配准"):
+        require_metric_scale(_NoGeo(), AppState(), (100, 100))
+
+
+def test_export_blocks_when_harvester_parameters_changed_after_planning():
+    from pyside6_app.main_window import MainWindow
+
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.geo = _MetricGeo()
+    window.state.harvester_params = window._effective_harvester_params({})
+    planned = dict(window.state.harvester_params)
+    planned["track_width_m"] += 0.1
+    window._pipeline_result = {
+        "path": {
+            "full_path": [[(1.0, 1.0), (2.0, 2.0)]],
+            "segment_types": ["work"],
+            "validation": {"valid": True, "issues": []},
+            "is_valid": True,
+            "planning_factors": {"harvester": planned},
+        }
+    }
+
+    with pytest.raises(ValueError, match="农机参数与路径规划时不一致"):
+        window._geo_export_payload()
+
+
+def test_input_changes_invalidate_stale_downstream_results():
+    from pyside6_app.main_window import MainWindow
+    from state import AutoPathSegment
+
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.state.auto_path = [AutoPathSegment()]
+    window.state.auto_path_segments = [AutoPathSegment()]
+    window.state.auto_path_planned = True
+    window.state.auto_path_valid = True
+    window.state.path_points = [(1.0, 1.0), (2.0, 2.0)]
+    window.state.simulation_done = True
+    window.state.export_done = True
+    window._pipeline_result = {"path": {"full_path": [[(1.0, 1.0), (2.0, 2.0)]]}}
+
+    window._invalidate_analysis_from("path", "test")
+
+    assert window.state.auto_path == []
+    assert window.state.auto_path_planned is False
+    assert window.state.auto_path_valid is False
+    assert window.state.path_points == []
+    assert window.state.simulation_done is False
+    assert window.state.export_done is False
+    assert window._pipeline_result is None
+
+
+def test_queued_project_save_serializes_enqueue_time_snapshot(tmp_path, monkeypatch):
+    import cache
+    from state import AppState
+
+    class DeferredThread:
+        targets = []
+
+        def __init__(self, target, **_kwargs):
+            self.target = target
+            self.__class__.targets.append(target)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(cache, "CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setattr(cache.threading, "Thread", DeferredThread)
+    cache._PENDING_STATE_SAVES.clear()
+    cache._ACTIVE_STATE_SAVERS.clear()
+    source = tmp_path / "field.tif"
+    source.write_bytes(b"source")
+    state = AppState()
+    state.tif_path = str(source)
+    state.field_area_m2 = 10.0
+
+    cache.request_project_state_save(str(source), state, stage="queued")
+    state.field_area_m2 = 99.0
+    DeferredThread.targets[-1]()
+
+    restored = cache.load_project_state(str(source))
+    assert restored["field_area_m2"] == 10.0
+
+
+def test_route_export_manifest_records_integrity_and_validation(tmp_path):
+    import hashlib
+    import json
+    from pyside6_app.main_window import MainWindow
+
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    output = tmp_path / "route.csv"
+    output.write_text("lon,lat\n120,30\n", encoding="utf-8")
+    points = [{
+        "lon": 120.0,
+        "lat": 30.0,
+        "pixel_x": 1.0,
+        "pixel_y": 2.0,
+        "segment_index": 0,
+        "point_index": 0,
+        "segment_type": "work",
+        "status": 1,
+    }]
+    path_result = {
+        "validation": {"valid": True, "issues": []},
+        "planning_factors": {"harvester": {"track_width_m": 0.45}},
+    }
+
+    manifest_path = window._write_export_manifest(
+        str(output), "CSV", path_result, points
+    )
+    manifest = json.loads(open(manifest_path, "r", encoding="utf-8").read())
+
+    assert manifest["output"]["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
+    assert manifest["analysis"]["validation"]["valid"] is True
+    assert manifest["integrity"]["config_sha256"]
+    assert manifest["integrity"]["route_data_sha256"]
+
+
+def test_machine_parameter_output_is_explicitly_unvalidated_heuristic():
+    from pyside6_app.main_window import MainWindow
+
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    recommendation = window._build_machine_recommendation({
+        "full_path": [[(0.0, 0.0), (1.0, 1.0)]],
+        "segment_types": ["work"],
+        "validation": {},
+    })
+
+    assert recommendation["validated"] is False
+    assert recommendation["method"] == "path_metric_heuristic_v1"
+    assert "没有 DEM" in recommendation["message"]

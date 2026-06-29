@@ -1,0 +1,71 @@
+{
+  "_schema_version": "1.1",
+  "window": {
+    "width": 1500,
+    "height": 900,
+    "title": "智能农机规划系统"
+  },
+  "model": {
+    "default_path": "data/models/yolov8s_seg_best.pt",
+    "model_list": [
+      {
+        "path": "data/models/yolo11m_seg_best.pt",
+        "name": "yolo11m_seg_best.pt",
+        "score": "mAP50=0.9355"
+      },
+      {
+        "path": "data/models/yolo11s_seg_best.pt",
+        "name": "yolo11s_seg_best.pt",
+        "score": "mAP50=0.9416"
+      },
+      {
+        "path": "data/models/yolov8s_seg_best.pt",
+        "name": "yolov8s_seg_best.pt",
+        "score": "mAP50=0.9396"
+      }
+    ],
+    "conf_threshold": 0.25,
+    "iou_threshold": 0.45,
+    "tile_size": 640,
+    "tile_overlap": 0.4,
+    "tile_capture_size": 640,
+    "eval_batch_size": 8,
+    "inference_strategy": "sahi",
+    "max_source_crop_pixels": 36000000
+  },
+  "harvester": {
+    "cutter_width_m": 2.15,
+    "track_width_m": 0.4,
+    "track_gauge_m": 1.7,
+    "wheelbase_m": 1.9,
+    "track_length_m": 1.8,
+    "turn_radius_m": 1.0
+  },
+  "path_planning": {
+    "min_turn_radius_m": 1.0,
+    "planning_max_dim": 3600,
+    "validation_max_dim": 3000,
+    "max_track_core_overlap_pct": 8.0,
+    "min_harvest_coverage_pct": 90.0,
+    "max_track_outside_field_pct": 2.0
+  },
+  "mask_processing": {
+    "strength": "standard",
+    "max_work_dim": 5000,
+    "band_width_threshold_m": 0.55,
+    "band_auto_calibrate": true
+  },
+  "geo": {
+    "default_epsg": "32650"
+  },
+  "ui": {
+    "language": "zh",
+    "mask_opacity": 0.3
+  },
+  "export": {
+    "route_id": 0,
+    "offset_x": "0.00",
+    "offset_y": "0.00",
+    "infoline": "$INFM,4,0.7,0.7,0.7,0.7,1,15,254*"
+  }
+}

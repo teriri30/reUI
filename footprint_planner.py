@@ -1,0 +1,581 @@
+"""Harvester-footprint-aware work-line generation and validation."""
+
+import math
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+from row_geometry import meters_per_pixel, odd_size, rotate_bound, smooth_1d
+
+
+Point = Tuple[float, float]
+
+
+def _field_support(mask: np.ndarray, state=None) -> np.ndarray:
+    support = np.zeros(mask.shape[:2], dtype=np.uint8)
+    boundary = getattr(state, "field_boundary", None) if state is not None else None
+    if boundary and len(boundary) >= 3:
+        offset_x = int(getattr(state, "mask_offset_x", 0))
+        offset_y = int(getattr(state, "mask_offset_y", 0))
+        points = np.asarray(boundary, dtype=np.float64)
+        points[:, 0] -= offset_x
+        points[:, 1] -= offset_y
+        cv2.fillPoly(support, [np.round(points).astype(np.int32)], 255)
+        if np.count_nonzero(support) > 0:
+            return support
+
+    points = cv2.findNonZero((mask > 0).astype(np.uint8))
+    if points is None or len(points) < 3:
+        return support
+    hull = cv2.convexHull(points)
+    cv2.fillPoly(support, [hull], 255)
+    return support
+
+
+def _interval_mean(cumulative: np.ndarray, start: int, end: int) -> float:
+    start = max(0, min(int(start), cumulative.size - 1))
+    end = max(start + 1, min(int(end), cumulative.size - 1))
+    return float(cumulative[end] - cumulative[start]) / max(end - start, 1)
+
+
+def _choose_layout(
+    crop_profile: np.ndarray,
+    core_profile: np.ndarray,
+    work_mpp: float,
+    cutter_width_m: float,
+    track_width_m: float,
+    track_gauge_m: float,
+    overlap_ratio: float,
+) -> Tuple[List[float], Dict]:
+    crop_rows = np.flatnonzero(crop_profile > max(0.03, float(np.max(crop_profile)) * 0.04))
+    if crop_rows.size < 2:
+        return [], {}
+
+    y_min = float(crop_rows[0])
+    y_max = float(crop_rows[-1])
+    cutter_px = cutter_width_m / work_mpp
+    track_px = track_width_m / work_mpp
+    gauge_px = track_gauge_m / work_mpp
+    base_swath = cutter_px * (1.0 - overlap_ratio)
+    crop_weight = np.maximum(crop_profile, 0.0)
+    crop_total = float(np.sum(crop_weight))
+    if crop_total <= 1e-6:
+        return [], {}
+
+    best = None
+    for swath_scale in (0.94, 1.0, 1.06):
+        swath = max(cutter_px * 0.55, base_swath * swath_scale)
+        phase_count = max(12, min(72, int(round(swath))))
+        for phase in np.linspace(0.0, swath, phase_count, endpoint=False):
+            centers = np.arange(
+                y_min - cutter_px / 2.0 + phase,
+                y_max + cutter_px / 2.0 + swath,
+                swath,
+            )
+            kept = []
+            cutter_union = np.zeros(crop_profile.size, dtype=bool)
+            core_sum = 0.0
+            soft_sum = 0.0
+            track_length = 0
+            for center in centers:
+                cutter_start = max(0, int(math.floor(center - cutter_px / 2.0)))
+                cutter_end = min(crop_profile.size, int(math.ceil(center + cutter_px / 2.0)))
+                if cutter_end <= cutter_start:
+                    continue
+                potential = float(np.sum(crop_weight[cutter_start:cutter_end]))
+                if potential < crop_total * 0.002:
+                    continue
+                kept.append(float(center))
+                cutter_union[cutter_start:cutter_end] = True
+                for track_center in (center - gauge_px / 2.0, center + gauge_px / 2.0):
+                    start = max(0, int(math.floor(track_center - track_px / 2.0)))
+                    end = min(crop_profile.size, int(math.ceil(track_center + track_px / 2.0)))
+                    if end <= start:
+                        continue
+                    core_sum += float(np.sum(core_profile[start:end]))
+                    soft_sum += float(np.sum(crop_profile[start:end]))
+                    track_length += end - start
+            if not kept:
+                continue
+            coverage = float(np.sum(crop_weight[cutter_union]) / crop_total)
+            core_overlap = core_sum / max(track_length, 1)
+            soft_overlap = soft_sum / max(track_length, 1)
+            objective = (
+                15.0 * (1.0 - coverage)
+                + 12.0 * core_overlap
+                + 2.0 * soft_overlap
+                + 0.012 * len(kept)
+            )
+            item = (
+                objective,
+                kept,
+                {
+                    "predicted_harvest_coverage_pct": coverage * 100.0,
+                    "predicted_track_core_overlap_pct": core_overlap * 100.0,
+                    "predicted_track_canopy_overlap_pct": soft_overlap * 100.0,
+                    "pass_count": len(kept),
+                    "swath_m": swath * work_mpp,
+                },
+            )
+            if best is None or item[0] < best[0]:
+                best = item
+
+    if best is None:
+        return [], {}
+    return best[1], best[2]
+
+
+def _longest_true_run(values: np.ndarray) -> Optional[Tuple[int, int]]:
+    values = np.asarray(values, dtype=bool)
+    changes = np.flatnonzero(np.diff(values.astype(np.int8))) + 1
+    bounds = np.concatenate(([0], changes, [values.size]))
+    runs = [
+        (int(bounds[index]), int(bounds[index + 1]))
+        for index in range(len(bounds) - 1)
+        if values[bounds[index]]
+    ]
+    return max(runs, key=lambda item: item[1] - item[0]) if runs else None
+
+
+def _optimize_line(
+    baseline_y: float,
+    crop: np.ndarray,
+    core: np.ndarray,
+    support: np.ndarray,
+    work_mpp: float,
+    cutter_width_m: float,
+    track_width_m: float,
+    track_gauge_m: float,
+    headland_buffer_m: float,
+    config: Dict,
+) -> Optional[np.ndarray]:
+    cutter_px = cutter_width_m / work_mpp
+    track_px = track_width_m / work_mpp
+    gauge_px = track_gauge_m / work_mpp
+    half_cutter = max(1, int(round(cutter_px / 2.0)))
+    y0 = max(0, int(round(baseline_y)) - half_cutter)
+    y1 = min(support.shape[0], int(round(baseline_y)) + half_cutter + 1)
+    row_support = np.mean(support[y0:y1] > 0, axis=0) >= 0.18
+    support_run = _longest_true_run(row_support)
+    if support_run is None:
+        return None
+
+    start_x, end_x = support_run
+    trim_px = max(0, int(round(headland_buffer_m / work_mpp)))
+    if end_x - start_x > 2 * trim_px + 10:
+        start_x += trim_px
+        end_x -= trim_px
+    if end_x - start_x < 10:
+        return None
+
+    sample_step = max(2, int(round(float(config.get("station_interval_m", 0.25)) / work_mpp)))
+    window_half = max(1, int(round(float(config.get("station_window_m", 0.16)) / work_mpp / 2.0)))
+    x_values = np.arange(start_x, end_x + 1, sample_step, dtype=np.int32)
+    if x_values.size < 3:
+        return None
+
+    search_m = float(config.get("lateral_search_m", 0.25))
+    lateral_step_m = float(config.get("lateral_step_m", 0.025))
+    offset_values = np.arange(
+        -search_m,
+        search_m + lateral_step_m * 0.5,
+        lateral_step_m,
+    ) / work_mpp
+    data_cost = np.zeros((x_values.size, offset_values.size), dtype=np.float64)
+
+    for x_index, x_value in enumerate(x_values):
+        x0 = max(0, int(x_value) - window_half)
+        x1 = min(crop.shape[1], int(x_value) + window_half + 1)
+        crop_profile = np.mean(crop[:, x0:x1] > 0, axis=1).astype(np.float64)
+        core_profile = np.mean(core[:, x0:x1] > 0, axis=1).astype(np.float64)
+        support_profile = np.mean(support[:, x0:x1] > 0, axis=1).astype(np.float64)
+        crop_cumulative = np.concatenate(([0.0], np.cumsum(crop_profile)))
+        core_cumulative = np.concatenate(([0.0], np.cumsum(core_profile)))
+        support_cumulative = np.concatenate(([0.0], np.cumsum(support_profile)))
+
+        for offset_index, offset in enumerate(offset_values):
+            center = baseline_y + offset
+            core_overlap = 0.0
+            canopy_overlap = 0.0
+            track_support = 0.0
+            for track_center in (center - gauge_px / 2.0, center + gauge_px / 2.0):
+                start = int(round(track_center - track_px / 2.0))
+                end = int(round(track_center + track_px / 2.0)) + 1
+                core_overlap += _interval_mean(core_cumulative, start, end)
+                canopy_overlap += _interval_mean(crop_cumulative, start, end)
+                track_support += _interval_mean(support_cumulative, start, end)
+            core_overlap *= 0.5
+            canopy_overlap *= 0.5
+            track_support *= 0.5
+
+            cutter_start = int(round(center - cutter_px / 2.0))
+            cutter_end = int(round(center + cutter_px / 2.0)) + 1
+            cutter_crop = _interval_mean(crop_cumulative, cutter_start, cutter_end)
+            cutter_support = _interval_mean(support_cumulative, cutter_start, cutter_end)
+            outside = 1.0 - min(track_support, cutter_support)
+            normalized_offset = offset * work_mpp / max(search_m, 1e-6)
+            data_cost[x_index, offset_index] = (
+                25.0 * core_overlap
+                + 5.0 * canopy_overlap
+                + 20.0 * outside
+                - 1.5 * cutter_crop
+                + 0.8 * normalized_offset * normalized_offset
+            )
+
+    smooth_penalty = float(config.get("lateral_smooth_penalty", 0.12))
+    dp = np.full_like(data_cost, np.inf)
+    previous = np.zeros(data_cost.shape, dtype=np.int32)
+    dp[0] = data_cost[0]
+    indices = np.arange(offset_values.size)
+    for station in range(1, x_values.size):
+        for current in range(offset_values.size):
+            transition = dp[station - 1] + smooth_penalty * (indices - current) ** 2
+            best_previous = int(np.argmin(transition))
+            previous[station, current] = best_previous
+            dp[station, current] = data_cost[station, current] + transition[best_previous]
+
+    chosen = np.zeros(x_values.size, dtype=np.int32)
+    chosen[-1] = int(np.argmin(dp[-1]))
+    for station in range(x_values.size - 1, 0, -1):
+        chosen[station - 1] = previous[station, chosen[station]]
+    offsets = offset_values[chosen]
+    offsets = smooth_1d(
+        offsets,
+        float(config.get("path_smooth_m", 0.75))
+        / max(sample_step * work_mpp, 1e-6),
+    )
+    return np.column_stack([x_values.astype(np.float64), baseline_y + offsets])
+
+
+def generate_work_lines(
+    processed_mask: np.ndarray,
+    main_angle: float,
+    geo=None,
+    state=None,
+    harvester: Optional[Dict] = None,
+    config: Optional[Dict] = None,
+    progress_callback=None,
+) -> Tuple[List[List[Point]], Dict]:
+    """Generate coverage passes whose two track footprints avoid crop cores."""
+    cfg = config or {}
+    specs = harvester or {}
+    cutter_width_m = float(specs.get("cutter_width_m", 2.15))
+    track_width_m = float(specs.get("track_width_m", 0.4))
+    track_gauge_m = float(specs.get("track_gauge_m", 1.7))
+    headland_buffer_m = float(cfg.get("headland_buffer_m", 3.0))
+
+    def report(value: float, stage: str):
+        if progress_callback:
+            try:
+                progress_callback(value, stage)
+            except Exception:
+                pass
+
+    raw = (np.asarray(processed_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    h, w = raw.shape[:2]
+    mpp = meters_per_pixel(raw, geo, state)
+    target_mpp = float(cfg.get("planning_resolution_m", 0.02))
+    max_dim = int(cfg.get("planning_max_dim", 3600))
+    scale = min(1.0, mpp / max(target_mpp, mpp), float(max_dim) / max(h, w))
+    work = cv2.resize(
+        raw,
+        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+    work = (work >= 96).astype(np.uint8) * 255
+    support_full = _field_support(raw, state)
+    support_work = cv2.resize(
+        support_full,
+        (work.shape[1], work.shape[0]),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    work_mpp = mpp / scale
+
+    report(0.08, "建立农机足迹地图")
+    crop_rotated, matrix = rotate_bound(work, math.degrees(main_angle), cv2.INTER_NEAREST)
+    support_rotated = cv2.warpAffine(
+        support_work,
+        matrix,
+        (crop_rotated.shape[1], crop_rotated.shape[0]),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    inverse = cv2.invertAffineTransform(matrix)
+    if np.count_nonzero(support_rotated) == 0:
+        support_rotated = cv2.morphologyEx(
+            crop_rotated,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (
+                    odd_size(1.2 / work_mpp),
+                    odd_size(1.4 / work_mpp),
+                ),
+            ),
+        )
+
+    erosion_m = float(cfg.get("crop_core_erosion_m", 0.10))
+    erosion_px = max(1, int(round(erosion_m / work_mpp)))
+    core = cv2.erode(
+        crop_rotated,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (odd_size(erosion_px * 2 + 1), odd_size(erosion_px * 2 + 1)),
+        ),
+        iterations=1,
+    )
+    support_counts = np.sum(support_rotated > 0, axis=1).astype(np.float64)
+    crop_profile = np.divide(
+        np.sum(crop_rotated > 0, axis=1),
+        np.maximum(support_counts, 1.0),
+    )
+    core_profile = np.divide(
+        np.sum(core > 0, axis=1),
+        np.maximum(support_counts, 1.0),
+    )
+    crop_profile = smooth_1d(crop_profile, max(3, 0.04 / work_mpp))
+    core_profile = smooth_1d(core_profile, max(3, 0.04 / work_mpp))
+
+    report(0.18, "优化割台覆盖相位")
+    centers, layout = _choose_layout(
+        crop_profile,
+        core_profile,
+        work_mpp,
+        cutter_width_m,
+        track_width_m,
+        track_gauge_m,
+        overlap_ratio=float(cfg.get("cutter_overlap_ratio", 0.12)),
+    )
+    if not centers:
+        return [], {"reason": "no_feasible_layout"}
+
+    report(0.28, "逐作业线避碾优化")
+    work_lines = []
+    for index, center in enumerate(centers):
+        line_rotated = _optimize_line(
+            center,
+            crop_rotated,
+            core,
+            support_rotated,
+            work_mpp,
+            cutter_width_m,
+            track_width_m,
+            track_gauge_m,
+            headland_buffer_m,
+            cfg,
+        )
+        if line_rotated is None or len(line_rotated) < 2:
+            continue
+        line_work = cv2.transform(
+            line_rotated.reshape(-1, 1, 2).astype(np.float64),
+            inverse,
+        ).reshape(-1, 2)
+        line_full = line_work / scale
+        work_lines.append([(float(x), float(y)) for x, y in line_full])
+        report(
+            0.28 + 0.62 * (index + 1) / max(len(centers), 1),
+            f"作业线优化 {index + 1}/{len(centers)}",
+        )
+
+    layout.update({
+        "meters_per_pixel": float(mpp),
+        "planning_scale": float(scale),
+        "planning_resolution_m": float(work_mpp),
+        "crop_core_erosion_m": erosion_m,
+        "generated_pass_count": len(work_lines),
+    })
+    report(0.90, "作业线生成完成")
+    return work_lines, layout
+
+
+def _offset_polyline(points: np.ndarray, offset: float) -> np.ndarray:
+    if len(points) < 2:
+        return points.copy()
+    result = np.zeros_like(points, dtype=np.float64)
+    for index in range(len(points)):
+        if index == 0:
+            tangent = points[1] - points[0]
+        elif index == len(points) - 1:
+            tangent = points[-1] - points[-2]
+        else:
+            tangent = points[index + 1] - points[index - 1]
+        norm = float(np.linalg.norm(tangent))
+        if norm <= 1e-9:
+            normal = np.array([0.0, 0.0])
+        else:
+            normal = np.array([-tangent[1], tangent[0]]) / norm
+        result[index] = points[index] + normal * offset
+    return result
+
+
+def validate_footprints(
+    full_path: List[List[Point]],
+    processed_mask: np.ndarray,
+    geo=None,
+    state=None,
+    harvester: Optional[Dict] = None,
+    config: Optional[Dict] = None,
+    segment_types: Optional[List[str]] = None,
+    detected_mask: Optional[np.ndarray] = None,
+    planned_mask: Optional[np.ndarray] = None,
+    headland_mask: Optional[np.ndarray] = None,
+) -> Dict:
+    cfg = config or {}
+    if headland_mask is None:
+        headland_mask = cfg.get("headland_mask")
+    specs = harvester or {}
+    cutter_width_m = float(specs.get("cutter_width_m", 2.15))
+    track_width_m = float(specs.get("track_width_m", 0.4))
+    track_gauge_m = float(specs.get("track_gauge_m", 1.7))
+
+    raw = (np.asarray(processed_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    h, w = raw.shape[:2]
+    mpp = meters_per_pixel(raw, geo, state)
+    max_dim = int(cfg.get("validation_max_dim", 3000))
+    scale = min(1.0, float(max_dim) / max(h, w))
+    soft = cv2.resize(
+        raw,
+        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+    soft = (soft >= 96).astype(np.uint8) * 255
+    detected = None
+    if detected_mask is not None:
+        detected_raw = (
+            np.asarray(detected_mask, dtype=np.uint8) > 0
+        ).astype(np.uint8) * 255
+        if detected_raw.shape[:2] == raw.shape[:2]:
+            detected = cv2.resize(
+                detected_raw,
+                (soft.shape[1], soft.shape[0]),
+                interpolation=cv2.INTER_AREA,
+            )
+            detected = (detected >= 96).astype(np.uint8) * 255
+    planned = None
+    if planned_mask is not None:
+        planned_raw = (
+            np.asarray(planned_mask, dtype=np.uint8) > 0
+        ).astype(np.uint8) * 255
+        if planned_raw.shape[:2] == raw.shape[:2]:
+            planned = cv2.resize(
+                planned_raw,
+                (soft.shape[1], soft.shape[0]),
+                interpolation=cv2.INTER_AREA,
+            )
+            planned = (planned >= 96).astype(np.uint8) * 255
+    headland = None
+    if headland_mask is not None:
+        headland_raw = (
+            np.asarray(headland_mask, dtype=np.uint8) > 0
+        ).astype(np.uint8) * 255
+        if headland_raw.shape[:2] == raw.shape[:2]:
+            headland = cv2.resize(
+                headland_raw,
+                (soft.shape[1], soft.shape[0]),
+                interpolation=cv2.INTER_AREA,
+            )
+            headland = (headland >= 96).astype(np.uint8) * 255
+    support_source = raw if headland is None else cv2.bitwise_or(raw, (np.asarray(headland_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255)
+    support = cv2.resize(
+        _field_support(support_source, state),
+        (soft.shape[1], soft.shape[0]),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    work_mpp = mpp / scale
+    erosion_m = float(cfg.get("crop_core_erosion_m", 0.10))
+    erosion_px = max(1, int(round(erosion_m / work_mpp)))
+    core = cv2.erode(
+        soft,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (odd_size(erosion_px * 2 + 1), odd_size(erosion_px * 2 + 1)),
+        ),
+        iterations=1,
+    )
+
+    track_swept = np.zeros_like(soft)
+    cutter_swept = np.zeros_like(soft)
+    track_half_gauge_px = track_gauge_m / work_mpp / 2.0
+    track_thickness = odd_size(track_width_m / work_mpp, minimum=1)
+    cutter_thickness = odd_size(cutter_width_m / work_mpp, minimum=1)
+
+    for segment_index, segment in enumerate(full_path):
+        if len(segment) < 2:
+            continue
+        points = np.asarray(segment, dtype=np.float64) * scale
+        left = _offset_polyline(points, -track_half_gauge_px)
+        right = _offset_polyline(points, track_half_gauge_px)
+        cv2.polylines(
+            track_swept,
+            [np.round(left).astype(np.int32)],
+            False,
+            255,
+            track_thickness,
+            cv2.LINE_AA,
+        )
+        cv2.polylines(
+            track_swept,
+            [np.round(right).astype(np.int32)],
+            False,
+            255,
+            track_thickness,
+            cv2.LINE_AA,
+        )
+        segment_type = (
+            segment_types[segment_index]
+            if segment_types and segment_index < len(segment_types)
+            else ("work" if segment_index % 2 == 0 else "turn")
+        )
+        if segment_type == "work":
+            cv2.polylines(
+                cutter_swept,
+                [np.round(points).astype(np.int32)],
+                False,
+                255,
+                cutter_thickness,
+                cv2.LINE_AA,
+            )
+
+    track_area = max(int(np.count_nonzero(track_swept)), 1)
+    crop_area = max(int(np.count_nonzero(soft)), 1)
+    core_area = max(int(np.count_nonzero(core)), 1)
+    track_canopy = int(np.count_nonzero((track_swept > 0) & (soft > 0)))
+    track_core = int(np.count_nonzero((track_swept > 0) & (core > 0)))
+    harvested = int(np.count_nonzero((cutter_swept > 0) & (soft > 0)))
+    detected_crop_area = max(int(np.count_nonzero(detected)), 1) if detected is not None else 1
+    detected_harvested = (
+        int(np.count_nonzero((cutter_swept > 0) & (detected > 0)))
+        if detected is not None
+        else 0
+    )
+    planned_crop_area = max(int(np.count_nonzero(planned)), 1) if planned is not None else crop_area
+    planned_harvested = (
+        int(np.count_nonzero((cutter_swept > 0) & (planned > 0)))
+        if planned is not None
+        else harvested
+    )
+    outside = int(np.count_nonzero((track_swept > 0) & (support == 0)))
+    headland_track = (
+        int(np.count_nonzero((track_swept > 0) & (headland > 0)))
+        if headland is not None
+        else 0
+    )
+
+    return {
+        "track_canopy_overlap_pct": track_canopy / track_area * 100.0,
+        "track_core_overlap_pct": track_core / track_area * 100.0,
+        "rolling_crop_pct": track_core / core_area * 100.0,
+        "harvest_coverage_pct": harvested / crop_area * 100.0,
+        "planned_target_coverage_pct": planned_harvested / planned_crop_area * 100.0,
+        "detected_harvest_coverage_pct": (
+            detected_harvested / detected_crop_area * 100.0
+            if detected is not None
+            else 0.0
+        ),
+        "track_outside_field_pct": outside / track_area * 100.0,
+        "track_headland_overlap_pct": headland_track / track_area * 100.0,
+        "footprint_resolution_m": float(work_mpp),
+        "crop_core_erosion_m": erosion_m,
+    }

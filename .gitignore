@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime state
+config.json
+recent_files.json
+.hillcache/
+logs/
+*.log
+*.tmp
+
+# Large local assets
+data/models/*.pt
+data/models/*.pth
+data/models/*.onnx
+data/tif/
+*.tif
+*.tiff
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

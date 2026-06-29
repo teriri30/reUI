@@ -1,0 +1,97 @@
+import math
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import numpy as np
+import pytest
+from PySide6.QtWidgets import QApplication
+
+from pyside6_app.main_window import MainWindow
+
+
+class _GoodGeo:
+    def is_ready(self):
+        return True
+
+    def pixel_to_lonlat(self, x, y):
+        return 120.0 + float(x) * 0.001, 30.0 + float(y) * 0.001
+
+    def pixel_distance_m(self, a, b):
+        return math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
+
+
+class _FailingGeo(_GoodGeo):
+    def pixel_to_lonlat(self, x, y):
+        if float(x) >= 10.0:
+            raise RuntimeError("bad transform")
+        return super().pixel_to_lonlat(x, y)
+
+
+def test_path_to_geo_fails_instead_of_writing_fake_zero_coordinates():
+    from path_planner import path_to_geo
+
+    with pytest.raises(ValueError, match="地理坐标转换失败"):
+        path_to_geo([[(0.0, 0.0), (10.0, 0.0)]], _FailingGeo(), object(), ["work"])
+
+
+def test_geo_export_validation_rejects_empty_or_mismatched_points(tmp_path):
+    from path_planner import export_csv, validate_geo_points
+
+    with pytest.raises(ValueError, match="没有有效地理坐标点"):
+        export_csv([], str(tmp_path / "empty.csv"))
+
+    points = [{"lon": 120.0, "lat": 30.0, "pixel_x": 0.0, "pixel_y": 0.0}]
+    with pytest.raises(ValueError, match="数量不一致"):
+        validate_geo_points(points, expected_count=2)
+
+
+def test_path_format_preserves_turn_segment_status(tmp_path):
+    from path_planner import export_path_format
+
+    output = tmp_path / "mission.path"
+    export_path_format(
+        [
+            {
+                "lon": 120.0,
+                "lat": 30.0,
+                "pixel_x": 0.0,
+                "pixel_y": 0.0,
+                "segment_type": "turn",
+            }
+        ],
+        str(output),
+    )
+
+    assert output.read_text(encoding="utf-8").splitlines()[0].endswith(",0*")
+
+
+def test_manual_route_edit_refreshes_path_but_blocks_unvalidated_export(monkeypatch):
+    QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._tif_rgb = np.zeros((20, 20, 3), dtype=np.uint8)
+    window.geo = _GoodGeo()
+    window.state.path_points = [(0.0, 0.0), (10.0, 0.0), (10.0, 5.0)]
+    window.state.path_status = [1, 0]
+    window._pipeline_result = {
+        "path": {
+            "full_path": [[(99.0, 99.0), (100.0, 100.0)]],
+            "segment_types": ["work"],
+            "geo_points": [
+                {"lon": 1.0, "lat": 1.0, "pixel_x": 99.0, "pixel_y": 99.0},
+                {"lon": 2.0, "lat": 2.0, "pixel_x": 100.0, "pixel_y": 100.0},
+            ],
+        }
+    }
+
+    monkeypatch.setattr(window.route_info, "update_from_auto_path", lambda _path: None)
+
+    window._sync_auto_path_from_editable_route()
+    path_result = window._normalise_path_result(window._pipeline_result["path"])
+    geo_points = path_result["geo_points"]
+
+    assert path_result["full_path"] == [[(0.0, 0.0), (10.0, 0.0)], [(10.0, 0.0), (10.0, 5.0)]]
+    assert [point["pixel_x"] for point in geo_points] == [0.0, 10.0, 10.0, 10.0]
+    assert all(point["lon"] >= 120.0 for point in geo_points)
+    with pytest.raises(ValueError, match="未通过安全验证"):
+        window._geo_export_payload()

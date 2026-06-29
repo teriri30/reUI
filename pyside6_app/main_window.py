@@ -1,0 +1,3523 @@
+
+"""
+main_window.py - PySide6 主窗口。
+"""
+import os, sys, time, json, math, threading, hashlib, datetime
+from typing import Optional, List, Tuple
+import numpy as np
+import cv2
+from PySide6.QtCore import Qt, QThread, QTimer, Slot, QPointF
+from PySide6.QtGui import QAction, QKeySequence, QFont, QGuiApplication
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QFileDialog, QMessageBox, QStatusBar, QTabWidget, QLabel, QProgressBar,
+    QDialog, QInputDialog, QApplication, QPushButton,
+)
+from config import Config, AppLogger, save_json_atomic
+from state import AppState, AutoPathSegment, PathPoint
+from geo import GeoUtils
+from model import ModelEngine, scan_model_dir
+from pyside6_app.image_view import ImageViewerGroup
+from pyside6_app.panels import TaskPanel, ParamPanel, LogPanel, RouteInfoPanel
+from pyside6_app.top_bar import TopToolbar
+from pyside6_app.workers import PipelineWorker, MaskProcessWorker, PlanWorker, TifLoadWorker, CacheRestoreWorker
+from pyside6_app.event_handler import EventBridge
+from pyside6_app.dialogs import (
+    HarvesterParamsDialog, ModelManagerDialog, SettingsDialog,
+    ProjectLogDialog, ReportDialog, DiagnosisDialog, LoadingProgress,
+    MachineRecommendationDialog,
+)
+from pyside6_app.launcher import LauncherDialog
+from pyside6_app.styles import COLORS, ThemeManager, ThemeMode, THEMES, build_stylesheet
+from pyside6_app.task_state import TASK_ORDER, TASK_LABELS, derive_task_statuses, rollback_summary
+from workflow import WorkflowUpdater, AnimationEngine
+from project_log import ProjectJournal
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("智能农机规划系统")
+        self.resize(1600, 1000); self.setMinimumSize(1024, 680)
+        self._theme_mgr = ThemeManager.instance()
+        self._theme_mgr.theme_changed.connect(self._on_theme_changed)
+        self.apply_stylesheet()
+        self.cfg = Config(); self.cfg.load()
+        self.state = AppState(); self.geo = GeoUtils()
+        self._mask_processing_strength = str(self.cfg._raw.get("mask_processing", {}).get("strength", "standard"))
+        # 从 config.json 加载农机参数；缺项使用 Config 默认值补齐，避免默认参数被判定“不完整”。
+        self.state.harvester_params = self._effective_harvester_params({})
+        self.model_engine = ModelEngine()
+        self._tif_rgb: Optional[np.ndarray] = None
+        self._tif_path: Optional[str] = None
+        self._tif_source_identity: dict = {}
+        self._file_hash_cache: dict = {}
+        self._pipeline_result: Optional[dict] = None
+        self._log = AppLogger()
+        self._journal = ProjectJournal()
+        self.event_bridge = EventBridge(self.state, self.geo)
+        # 动画引擎
+        self._anim_engine: Optional[AnimationEngine] = None
+        self._anim_timer: Optional[QTimer] = None
+        self._anim_trail: List[Tuple[int, int]] = []  # 轨迹尾迹
+        self._anim_overlay_items = []
+        # 田块边界绘制状态
+        self._field_drawing = False
+        self._field_pts: List[Tuple[int, int]] = []
+        self._measure_tool = ""
+        self._measure_points: List[Tuple[int, int]] = []
+        self._route_edit_active = False
+        self._route_drag_idx = -1
+        self._show_mask_before = False
+        self._service_points_visible = False
+        # 起终点与卸粮点放置状态：0=起点, 1=终点, 2+=卸粮点
+        self._entry_exit_click_idx = 0
+        # 模型列表
+        self._model_list: list = []
+        self._build_menu(); self._build_central(); self._build_statusbar()
+        self.task_panel.set_mask_strength(self._mask_processing_strength)
+        self._connect_signals()
+        self.top_toolbar.update_theme_icon(self._theme_mgr.current_theme())
+        self._state_timer = QTimer(self)
+        self._state_timer.timeout.connect(self._refresh_state); self._state_timer.start(200)
+        self._pending_segment_display = False
+        self._pending_plan_display = False
+        self._pending_timer = QTimer(self)
+        self._pending_timer.timeout.connect(self._process_pending); self._pending_timer.start(50)
+        self._worker_thread: Optional[QThread] = None
+        self._worker: Optional[PipelineWorker] = None
+        self._task_cancel_requested = False
+        self._close_after_worker_cancel = False
+        self._close_cancel_started_at = 0.0
+        self._close_cancel_warning_shown = False
+        self._processed_mask_save_generation = 0
+        self._processed_mask_save_threads = []
+        self._processed_mask_save_lock = threading.Lock()
+        self._log.info("desktop startup complete")
+        if not os.environ.get("REUI_DISABLE_AUTO_START"):
+            QTimer.singleShot(300, self._auto_start)
+
+    # UI 构建
+
+    def _effective_harvester_params(self, override=None):
+        """Return complete harvester geometry, filling missing config/project keys with defaults."""
+        params = {
+            "cutter_width_m": float(self.cfg.CUTTER_WIDTH_M),
+            "track_width_m": float(self.cfg.TRACK_WIDTH_M),
+            "track_gauge_m": float(self.cfg.TRACK_GAUGE_M),
+            "wheelbase_m": float(self.cfg.WHEELBASE_M),
+            "track_length_m": float(self.cfg.TRACK_LENGTH_M),
+            "turn_radius_m": float(self.cfg.TURN_RADIUS_M),
+        }
+        for source in (self.cfg._raw.get("harvester", {}) or {}, override or {}):
+            if not isinstance(source, dict):
+                continue
+            for key in params:
+                value = source.get(key)
+                if value not in (None, ""):
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        params[key] = value
+        return params
+
+    def apply_stylesheet(self):
+        self.setStyleSheet(build_stylesheet(self._theme_mgr.colors()))
+
+    def _on_theme_changed(self, theme):
+        # 更新全局 COLORS dict，供其他模块引用。
+        import pyside6_app.styles as _styles
+        new_colors = dict(self._theme_mgr.colors())
+        _styles.COLORS.clear()
+        _styles.COLORS.update(new_colors)
+        self.apply_stylesheet()
+        # 刷新所有面板内联样式。
+        self.task_panel.refresh_theme()
+        self.top_toolbar.refresh_theme()
+        self.top_toolbar.update_theme_icon(theme)
+        self.route_info.refresh_theme()
+        for v in (self.image_view,):
+            v.refresh_theme()
+        # 强制重绘。
+        self.update()
+        self._log.info(f"主题切换: {theme}")
+
+    def _build_menu(self):
+        """Register menus and shortcuts."""
+        mb = self.menuBar()
+        sm = mb.addMenu("系统设置")
+        self._add_action(sm, "系统设置...", "Ctrl+Shift+S", self._on_settings_dialog)
+        self._add_action(sm, "农机参数...", "Ctrl+P", self._on_params_dialog)
+        self._add_action(sm, "模型管理...", "Ctrl+Shift+M", self._on_model_manager)
+        sm.addSeparator()
+        self._add_action(sm, "项目日志...", None, self._on_project_log)
+        self._add_action(sm, "系统诊断...", None, self._on_diagnose)
+
+        fm = mb.addMenu("文件")
+        self._add_action(fm, "打开影像...", QKeySequence.Open, self._on_open_tif)
+        self._add_action(fm, "保存项目", QKeySequence.Save, self._on_save_project)
+        self._add_action(fm, "加载模型...", "Ctrl+M", self._on_load_model)
+        fm.addSeparator()
+        self._add_action(fm, "导出 GeoJSON...", "Ctrl+E", self._on_export_geojson)
+        self._add_action(fm, "导出 CSV (经纬度)...", "Ctrl+Shift+E", self._on_export_csv_geo)
+        self._add_action(fm, "导出 KML...", None, self._on_export_kml)
+        self._add_action(fm, "导出 JSON...", None, self._on_export_json)
+        self._add_action(fm, "导出 $PATH 格式...", None, self._on_export_path_format)
+        self._add_action(fm, "导出快照 PNG...", None, self._on_export_img)
+        fm.addSeparator()
+        self._add_action(fm, "退出", QKeySequence.Quit, self.close)
+
+        vm = mb.addMenu("视图")
+        self._add_action(vm, "适应窗口", "Ctrl+0", lambda: self.image_view.viewer.fit_to_view())
+        self._add_action(vm, "放大", "Ctrl++", lambda: self.image_view.viewer.zoom_in())
+        self._add_action(vm, "缩小", "Ctrl+-", lambda: self.image_view.viewer.zoom_out())
+        self._add_action(vm, "重置视图", None, lambda: self.image_view.viewer.reset_view())
+        self._add_action(vm, "旋转 90°", "R", lambda: self.image_view.viewer.set_rotation(
+            self.image_view.viewer._rotation_deg + 90))
+        vm.addSeparator()
+        style_menu = vm.addMenu("系统样式")
+        self._add_action(style_menu, "深色", None, lambda: self._set_theme_mode(ThemeMode.DARK))
+        self._add_action(style_menu, "浅色", None, lambda: self._set_theme_mode(ThemeMode.LIGHT))
+        self._add_action(style_menu, "跟随系统", None, lambda: self._set_theme_mode(ThemeMode.SYSTEM))
+        vm.addSeparator()
+
+        tm = mb.addMenu("工具")
+        self._add_action(tm, "田块圈选", "Ctrl+B", self._on_toggle_field_drawing)
+        self._add_action(tm, "布设起终点与卸粮点", None, self._on_toggle_entry_exit)
+        tm.addSeparator()
+        self._add_action(tm, "运行", "Ctrl+R", self._on_run)
+        self._add_action(tm, "掩膜处理", None, self._on_mask_process)
+        self._add_action(tm, "农机参数...", "Ctrl+P", self._on_params_dialog)
+        self._add_action(tm, "模型管理...", "Ctrl+Shift+M", self._on_model_manager)
+        tm.addSeparator()
+        self._add_action(tm, "设置...", "Ctrl+Shift+S", self._on_settings_dialog)
+        self._add_action(tm, "项目日志...", None, self._on_project_log)
+        self._add_action(tm, "系统诊断...", None, self._on_diagnose)
+    def _add_action(self, menu, text, shortcut, slot):
+        act = QAction(text, self)
+        if shortcut: act.setShortcut(QKeySequence(shortcut))
+        act.triggered.connect(slot); menu.addAction(act); return act
+
+    def _build_central(self):
+        c = QWidget(); c.setObjectName("central"); self.setCentralWidget(c)
+        lo = QVBoxLayout(c); lo.setContentsMargins(0,0,0,0); lo.setSpacing(0)
+        self.top_toolbar = TopToolbar(); lo.addWidget(self.top_toolbar)
+        sp = QSplitter(Qt.Horizontal); sp.setHandleWidth(2)
+        # 左侧栏：任务清单 + 路径结果（垂直分割）
+        left_split = QSplitter(Qt.Vertical); left_split.setHandleWidth(2)
+        self.task_panel = TaskPanel()
+        left_split.addWidget(self.task_panel)
+        self.route_info = RouteInfoPanel()
+        left_split.addWidget(self.route_info)
+        left_split.setStretchFactor(0, 3); left_split.setStretchFactor(1, 2)
+        left_split.setSizes([640, 280])
+        sp.addWidget(left_split)
+        # 右侧：影像视图（底图、掩膜、路径）+ 日志
+        rp = QWidget()
+        rl = QVBoxLayout(rp); rl.setContentsMargins(2,2,2,2); rl.setSpacing(2)
+        self.image_view = ImageViewerGroup()
+        rl.addWidget(self.image_view, 1)
+        self.log_panel = LogPanel()
+        rl.addWidget(self.log_panel)
+        sp.addWidget(rp); sp.setStretchFactor(0,0); sp.setStretchFactor(1,1); lo.addWidget(sp, 1)
+
+    def _connect_signals(self):
+        tp = self.task_panel
+        tp.load_tif_requested.connect(self._on_open_tif)
+        tp.load_model_requested.connect(self._on_load_model)
+        tp.run_requested.connect(self._on_run)
+        tp.segment_requested.connect(self._on_segment)
+        tp.process_requested.connect(self._on_mask_process)
+        tp.plan_requested.connect(self._on_plan)
+        tp.simulate_requested.connect(self._on_toggle_animation)
+        tp.params_requested.connect(self._on_params_dialog)
+        tp.entry_exit_toggle.connect(self._on_toggle_entry_exit)
+        tp.export_geojson_requested.connect(self._on_export_geojson)
+        tp.export_csv_requested.connect(self._on_export_csv_geo)
+        tp.export_img_requested.connect(self._on_export_img)
+        tp.field_drawing_requested.connect(self._on_toggle_field_drawing)
+        tp.model_changed.connect(self._on_model_combo_changed)
+        tp.mask_strength_changed.connect(self._on_mask_strength_changed)
+        tp.turn_strategy_changed.connect(self._on_turn_strategy_changed)
+        tp.route_edit_requested.connect(self._on_route_edit_requested)
+        tp.step_deleted.connect(self._on_step_deleted)
+        t = self.top_toolbar
+        t.action_clicked.connect(self._on_toolbar_action)
+        t.tool_changed.connect(self._on_tool_changed)
+        t.turn_strategy_changed.connect(self._on_turn_strategy_changed)
+        t.model_changed.connect(self._on_model_combo_changed)
+        t.model_dropdown_opened.connect(self._on_model_dropdown_open)
+        t.theme_toggle.connect(self._toggle_theme)
+        self.route_info.segment_selected.connect(self._on_segment_selected)
+        self.route_info.service_point_selected.connect(self._on_service_point_selected)
+        # 鼠标事件：田块圈选、起终点与卸粮点布设
+        self.event_bridge.double_clicked.connect(self._on_field_double_click)
+        vw = self.image_view.viewer
+        vw.mouse_pressed.connect(self._on_viewer_mouse_pressed)
+        vw.mouse_released.connect(self._on_viewer_mouse_released)
+        vw.mouse_moved.connect(self._on_viewer_mouse_moved)
+        vw.mouse_dragged.connect(self.event_bridge.on_mouse_dragged)
+        self.image_view.snapshot_requested.connect(self._on_save_snapshot)
+        self.image_view.mask_compare_requested.connect(self._on_toggle_mask_compare)
+        self.image_view.measure_tool_changed.connect(self._on_measure_tool_changed)
+
+    def _build_statusbar(self):
+        self.status_bar = QStatusBar()
+        self.lbl_status = QLabel("就绪")
+        self.lbl_speed = QLabel("")
+        self.progress_bar = QProgressBar(); self.progress_bar.setMaximumWidth(180)
+        self.progress_bar.setMaximumHeight(6); self.progress_bar.setTextVisible(False)
+        self.progress_bar.hide()
+        self.btn_cancel_task = QPushButton("取消")
+        self.btn_cancel_task.setToolTip("取消当前耗时任务")
+        self.btn_cancel_task.setAccessibleName("取消当前耗时任务")
+        self.btn_cancel_task.setFixedHeight(22)
+        self.btn_cancel_task.hide()
+        self.btn_cancel_task.clicked.connect(self._cancel_background_worker)
+        self.status_bar.addWidget(self.lbl_status, 1)
+        self.status_bar.addPermanentWidget(self.lbl_speed)
+        self.status_bar.addPermanentWidget(self.btn_cancel_task)
+        self.status_bar.addPermanentWidget(self.progress_bar)
+        self.setStatusBar(self.status_bar)
+
+    # 启动与影像加载
+
+
+    def _has_background_worker(self):
+        return bool(self._worker_thread and self._worker_thread.isRunning())
+
+    def _start_background_worker(self, worker, run_message):
+        """Start one cancellable worker without blocking the Qt UI thread."""
+        if self._has_background_worker():
+            QMessageBox.warning(self, "任务正在运行", "当前已有耗时任务正在执行，请等待完成后再操作。")
+            return False
+        self._worker_thread = QThread(self)
+        self._worker = worker
+        self._task_cancel_requested = False
+        worker.moveToThread(self._worker_thread)
+        worker.progress.connect(self._on_progress)
+        worker.error.connect(self._on_worker_error)
+        self._worker_thread.started.connect(worker.run)
+        self._worker_thread.finished.connect(worker.deleteLater)
+        self._worker_thread.finished.connect(self._clear_background_worker_refs)
+        self._worker_thread.start()
+        self.progress_bar.show()
+        if hasattr(self, 'btn_cancel_task'):
+            self.btn_cancel_task.show()
+        self.top_toolbar.set_worker_cancel_visible(True)
+        self.log_panel.info(run_message)
+        return True
+
+    def _cancel_background_worker(self):
+        """Request cancellation without treating it as a processing failure."""
+        if not self._has_background_worker():
+            return
+        self._task_cancel_requested = True
+        if getattr(self.state, 'mask_processing_running', False):
+            self.state.mask_processing_running = False
+            self.state.mask_processing_progress = 0.0
+            self.task_panel.set_task_status("process", "available", text="已取消")
+        if getattr(self.state, 'plan_running', False):
+            self.state.plan_running = False
+            self.state.plan_progress = 0.0
+            self.task_panel.set_task_status("plan", "available", text="已取消")
+        if self._worker and hasattr(self._worker, 'cancel'):
+            self._worker.cancel()
+        self.lbl_status.setText("正在取消当前任务...")
+        self.log_panel.info("已请求取消当前任务")
+        if hasattr(self, 'btn_cancel_task'):
+            self.btn_cancel_task.setEnabled(False)
+        if self._worker_thread:
+            self._worker_thread.quit()
+
+    def _finish_cancelled_background_worker(self):
+        if getattr(self.state, 'mask_processing_running', False):
+            self.state.mask_processing_running = False
+            self.state.mask_processing_progress = 0.0
+            self.task_panel.set_task_status("process", "available", text="已取消")
+        if getattr(self.state, 'plan_running', False):
+            self.state.plan_running = False
+            self.state.plan_progress = 0.0
+            self.task_panel.set_task_status("plan", "available", text="已取消")
+        self.progress_bar.hide()
+        if hasattr(self, 'btn_cancel_task'):
+            self.btn_cancel_task.hide()
+            self.btn_cancel_task.setEnabled(True)
+        self.top_toolbar.set_progress(0)
+        self.top_toolbar.set_worker_cancel_visible(False)
+        self.lbl_status.setText("已取消，可重试")
+        self.log_panel.info("当前任务已取消，可重新执行")
+        self._sync_task_statuses()
+        self.top_toolbar.refresh_actions(self.state)
+
+    @Slot()
+    def _clear_background_worker_refs(self):
+        was_cancelled = bool(getattr(self, '_task_cancel_requested', False))
+        self._worker_thread = None
+        self._worker = None
+        self._task_cancel_requested = False
+        if hasattr(self, 'btn_cancel_task'):
+            self.btn_cancel_task.hide()
+            self.btn_cancel_task.setEnabled(True)
+        if was_cancelled:
+            self._finish_cancelled_background_worker()
+        if getattr(self, '_close_after_worker_cancel', False):
+            self._close_after_worker_cancel = False
+            self._close_cancel_started_at = 0.0
+            self._close_cancel_warning_shown = False
+            QTimer.singleShot(0, self.close)
+
+    def _warn_close_cancel_still_running(self):
+        if (
+            not getattr(self, '_close_after_worker_cancel', False)
+            or not self._worker_thread
+            or not self._worker_thread.isRunning()
+            or getattr(self, '_close_cancel_warning_shown', False)
+        ):
+            return
+        self._close_cancel_warning_shown = True
+        message = "后台任务仍在取消中，请等待当前计算阶段安全退出后自动关闭。"
+        self.lbl_status.setText(message)
+        self.log_panel.info(message)
+        self._log.info(message)
+
+    def _classify_task_error(self, msg):
+        """Convert technical exceptions into user-actionable failure categories."""
+        text = str(msg or "")
+        lower = text.lower()
+        rules = [
+            ("掩膜为空", ["mask is none", "empty mask", "mask_raw", "掩膜为空", "空掩膜", "没有掩膜", "缺少处理后的掩膜"],
+             "当前没有可用于处理的 AI 掩膜。",
+             "请重新执行 AI识别；如果识别结果仍为空，请检查模型是否匹配当前影像。"),
+            ("没有有效行带", ["未能提取有效行带", "没有有效行带", "未生成有效作业线", "wide_bands", "work_lines", "no valid band", "no bands", "路径点不足"],
+             "系统没有从掩膜中提取到足够的水稻行带。",
+             "请重新圈选田块，或重新执行 AI识别与掩膜处理；必要时降低最小行带长度/面积阈值。"),
+            ("起点/终点缺失", ["entry_point", "exit_point", "起点", "终点", "缺少起点", "缺少终点"],
+             "路径规划缺少起点或终点。",
+             "请在“起点/终点”步骤确认系统推荐点，或手动重新布设。卸粮点是可选项。"),
+            ("农机参数不完整", ["harvester", "cutter_width", "turn_radius_m", "农机参数", "割台", "履带", "参数不完整"],
+             "农机几何参数不完整，无法判断割台覆盖和履带足迹。",
+             "请打开“农机参数”，检查割台宽度、履带宽度、履带中心距和最小转弯半径。"),
+            ("转弯半径无法满足", ["2r", "turn radius", "min_turn_radius", "转弯半径", "无法相切", "半径", "行距ω小于2r"],
+             "当前行距或田头空间无法满足所选调头方式的最小转弯半径。",
+             "请尝试切换为“自动推荐/鱼尾折返/紧凑 Alpha”，或调整农机最小转弯半径后重算。"),
+            ("路径越界严重", ["outside", "越界", "track_outside", "超出田块", "field boundary", "边界外", "履带越界率"],
+             "生成路径存在明显越界或履带超出田块边界。",
+             "请检查田块边界是否闭合准确，并适当增加田头缓冲或重新规划。"),
+        ]
+        for title, keywords, what, action in rules:
+            if any(key.lower() in lower for key in keywords):
+                return {"title": title, "what": what, "action": action, "raw": text}
+        return {
+            "title": "任务失败",
+            "what": "处理过程中出现未分类错误。",
+            "action": "请查看日志中的详细异常；若反复出现，请保存当前项目状态后重新执行上一步。",
+            "raw": text,
+        }
+
+    def _task_error_message(self, msg):
+        info = self._classify_task_error(msg)
+        detail = info["raw"][:500]
+        return info["title"], f"{info['what']}\n\n建议：{info['action']}\n\n详细信息：\n{detail}"
+
+    @Slot(str)
+    def _on_worker_error(self, msg):
+        if getattr(self, '_task_cancel_requested', False):
+            if self._worker_thread:
+                self._worker_thread.quit()
+            return
+        if getattr(self.state, 'mask_processing_running', False):
+            self.state.mask_processing_running = False
+            self.state.mask_processing_progress = 0.0
+            self.task_panel.set_task_status("process", "failed", text="失败")
+        if getattr(self.state, 'plan_running', False):
+            self.state.plan_running = False
+            self.state.plan_progress = 0.0
+            self.task_panel.set_task_status("plan", "failed", text="失败")
+        self.progress_bar.hide()
+        if hasattr(self, 'btn_cancel_task'):
+            self.btn_cancel_task.hide()
+        self.top_toolbar.set_progress(0)
+        self.top_toolbar.set_worker_cancel_visible(False)
+        title, message = self._task_error_message(msg)
+        self.lbl_status.setText(title)
+        self.log_panel.error(f"{title}: {msg[:300]}")
+        if self._worker_thread:
+            self._worker_thread.quit()
+        QMessageBox.warning(self, title, message)
+
+    @Slot(dict)
+    def _on_mask_worker_done(self, processed):
+        self.state.mask_processing_running = False
+        self.state.mask_processing_progress = 1.0
+        self.progress_bar.hide()
+        if hasattr(self, 'btn_cancel_task'):
+            self.btn_cancel_task.hide()
+        self.top_toolbar.set_progress(0)
+        self.top_toolbar.set_worker_cancel_visible(False)
+        self._apply_mask_process_result(processed)
+        if self._worker_thread:
+            self._worker_thread.quit()
+
+    @Slot(dict)
+    def _on_plan_worker_done(self, result):
+        self.state.plan_running = False
+        self.state.plan_progress = 1.0
+        self.progress_bar.hide()
+        if hasattr(self, 'btn_cancel_task'):
+            self.btn_cancel_task.hide()
+        self.top_toolbar.set_progress(0)
+        self.top_toolbar.set_worker_cancel_visible(False)
+        path_result = self._store_path_result(result.get("path", {}), result)
+        self._service_points_visible = True
+        self._show_path(path_result)
+        self.route_info.update_route(path_result, path_result.get("validation", {}))
+        WorkflowUpdater.advance(self.state, "PATH_PLANNED")
+        self._sync_task_statuses()
+        bands_count = len(result.get("bands", []))
+        tracks = len(path_result.get("tracks", []))
+        turns = len(path_result.get("turns", []))
+        self.lbl_status.setText("路径规划完成")
+        self.log_panel.success(self._path_quality_summary(path_result, bands_count, tracks, turns))
+        self._log_turn_strategy_comparison(path_result)
+        self._journal.info(f"路径规划完成: {bands_count}条带 {tracks}条作业线 {turns}条转弯线")
+        validation = path_result.get("validation", {}) or {}
+        if validation:
+            self._show_validation_report(path_result, validation)
+            self._warn_path_validation_issues(path_result)
+        QTimer.singleShot(0, lambda pr=path_result: self._show_machine_recommendation(pr))
+        if self._worker_thread:
+            self._worker_thread.quit()
+
+    def _set_theme_mode(self, mode):
+        self._theme_mgr.set_mode(mode)
+        labels = {
+            ThemeMode.DARK: "深色",
+            ThemeMode.LIGHT: "浅色",
+            ThemeMode.SYSTEM: "跟随系统",
+        }
+        self.log_panel.info(f"主题: {labels.get(mode, mode)}")
+
+    def _toggle_theme(self):
+        cur = self._theme_mgr.current_theme()
+        if cur == "dark":
+            self._theme_mgr.set_mode(ThemeMode.LIGHT)
+            self.log_panel.info("主题: 浅色")
+        elif cur == "light":
+            self._theme_mgr.set_mode(ThemeMode.SYSTEM)
+            self.log_panel.info("主题: 跟随系统")
+        else:
+            self._theme_mgr.set_mode(ThemeMode.DARK)
+            self.log_panel.info("主题: 深色")
+    def _builtin_model_dir(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(root, "data", "models")
+
+    def _builtin_model_list(self, model_dir=None):
+        model_dir = model_dir or self._builtin_model_dir()
+        names = [
+            "yolo11m_seg_best.pt",
+            "yolo11s_seg_best.pt",
+            "yolov8s_seg_best.pt",
+        ]
+        return [
+            {"name": name, "path": os.path.join(model_dir, name)}
+            for name in names
+            if os.path.isfile(os.path.join(model_dir, name))
+        ]
+
+    def _refresh_builtin_models(self):
+        merged = []
+        seen = set()
+        for model in self._builtin_model_list() + self._custom_model_list():
+            path = model.get("path", "")
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            merged.append({"name": model.get("name") or self._model_display_name(model), "path": path})
+        self._model_list = merged
+        names = [m["name"] for m in self._model_list]
+        self.top_toolbar.populate_models(names)
+        self.task_panel.set_model_options(self._model_list, self.state.current_model_path)
+        return self._model_list
+
+    def _ensure_model_loaded(self):
+        if self.model_engine.is_loaded():
+            return True
+        models = self._model_list or self._refresh_builtin_models()
+        if not models:
+            self.log_panel.error("未找到内置模型，请检查 data/models")
+            return False
+        return self._on_load_model_at(models[0]["path"])
+
+    def _auto_start(self):
+        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        data_dir = os.path.join(script_dir, "data")
+        data_models = os.path.join(data_dir, "models")
+
+        self._model_list = self._builtin_model_list(data_models)
+        if self._model_list:
+            names = [m.get("name", os.path.basename(m.get("path", ""))) for m in self._model_list]
+            self.top_toolbar.populate_models(names)
+            self.task_panel.populate_models(names)
+            self._log.info(f"loaded {len(self._model_list)} built-in models")
+
+        if self._tif_path:
+            return
+
+        if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+            self._load_tif_path(sys.argv[1])
+            return
+
+        dlg = LauncherDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            path = getattr(dlg, "selected_path", "")
+            if path:
+                QTimer.singleShot(100, lambda: self._load_tif_path(path))
+    def _load_tif_path(self, path):
+        """Load a GeoTIFF image and initialise display/georeference state."""
+        if self._has_background_worker():
+            QMessageBox.warning(self, "任务正在运行", "当前已有耗时任务正在执行，请等待完成后再打开影像。")
+            return
+        # Clear the previous image's transform immediately. A CRS-less image
+        # must never inherit geographic coordinates from the prior project.
+        self.geo.clear()
+        self._tif_source_identity = {}
+        worker = TifLoadWorker(path)
+        worker.finished.connect(self._on_tif_load_done)
+        self.lbl_status.setText("正在加载影像...")
+        self.top_toolbar.set_progress(5, "影像加载中...")
+        self.progress_bar.show()
+        self.progress_bar.setValue(5)
+        if not self._start_background_worker(worker, "影像加载已开始，请稍候..."):
+            self.progress_bar.hide()
+            self.top_toolbar.set_progress(0)
+
+    @Slot(dict)
+    def _on_tif_load_done(self, result):
+        try:
+            path = result["path"]
+            rgb = result["rgb"]
+            full_h = int(result["full_h"])
+            full_w = int(result["full_w"])
+            out_h = int(result["display_h"])
+            out_w = int(result["display_w"])
+            downsample = int(result["downsample"])
+            transformer = result.get("transformer")
+            self.geo.clear()
+            if transformer is not None and result.get("transform") is not None:
+                try:
+                    self.geo.set_affine(
+                        result["transform"],
+                        transformer,
+                        source_crs=result.get("crs"),
+                    )
+                    extent = self.geo.validate_raster_extent(out_w, out_h)
+                    self._log.info(
+                        f"georeference validated (source CRS: {result.get('crs')}, "
+                        "output CRS: EPSG:4326, "
+                        f"extent: {extent['min_lon']:.8f},{extent['min_lat']:.8f} - "
+                        f"{extent['max_lon']:.8f},{extent['max_lat']:.8f})"
+                    )
+                except Exception as exc:
+                    self.geo.clear()
+                    self._log.info(
+                        "georeference validation failed; geographic export is disabled: "
+                        f"{exc}"
+                    )
+            else:
+                self._log.info(
+                    "georeference unavailable; geographic export is disabled: "
+                    f"{result.get('geo_error') or 'missing CRS'}"
+                )
+            self._log.info(f"read image: 3 bands, {out_w}x{out_h}")
+            self._tif_rgb = rgb
+            self._tif_path = path
+            from cache import source_identity
+            self._tif_source_identity = source_identity(path)
+            self.state.tif_path = path
+            self.state.source_img_h, self.state.source_img_w = full_h, full_w
+            self.state.img_h, self.state.img_w = out_h, out_w
+            self.state.display_h, self.state.display_w = out_h, out_w
+            self.state.downsample_factor = downsample
+            self.state.display_scale_x = float(full_w) / float(out_w)
+            self.state.display_scale_y = float(full_h) / float(out_h)
+            self.top_toolbar.set_filename(path)
+            self.image_view.set_image(rgb)
+            try:
+                if self.geo.is_ready():
+                    cx, cy = full_w // 2, full_h // 2
+                    ppm = self.geo.pixels_per_meter(cx // max(1, downsample), cy // max(1, downsample))
+                    self._log.info(f"scale ppm={ppm:.4f} at center ({cx},{cy})")
+                    self.image_view.set_ppm(ppm)
+            except Exception as e:
+                self._log.info(f"scale calculation failed: {e}")
+            basename = os.path.basename(path)
+            self.log_panel.success(f"影像加载: {basename} ({full_w}x{full_h})")
+            self.lbl_status.setText(f"已加载 {basename}")
+            self._journal.info(f"影像加载: {basename}")
+            self.task_panel.set_task_status("import_img", "done")
+            self.task_panel.set_task_action("import_img", "重选")
+            self._sync_task_statuses()
+            self._start_cache_restore(path)
+        finally:
+            self.progress_bar.hide()
+            self.top_toolbar.set_progress(0)
+            if self._worker_thread:
+                self._worker_thread.quit()
+
+    def _start_cache_restore(self, path):
+        worker = CacheRestoreWorker(path)
+        worker.finished.connect(self._on_cache_restore_done)
+        if not self._start_background_worker(worker, "正在后台恢复项目缓存..."):
+            self._log.info("cache restore skipped: background worker busy")
+
+    @Slot(dict)
+    def _on_cache_restore_done(self, payload):
+        self._restore_cache_payload(payload)
+        if self._worker_thread:
+            self._worker_thread.quit()
+
+    def _restore_cache_payload(self, payload):
+        """Apply project cache already loaded by CacheRestoreWorker."""
+        try:
+            path = payload.get("path")
+            saved = payload.get("saved") or {}
+            if not saved:
+                return
+            processed_cache_valid = bool(payload.get("processed_cache_valid"))
+            raw_mask = payload.get("raw_mask")
+            raw_ox = int(payload.get("raw_ox", 0) or 0)
+            raw_oy = int(payload.get("raw_oy", 0) or 0)
+            processed_mask = payload.get("processed_mask")
+            proc_ox = int(payload.get("proc_ox", 0) or 0)
+            proc_oy = int(payload.get("proc_oy", 0) or 0)
+            restored_state = {
+                k: v for k, v in saved.items()
+                if k in (
+                    'field_boundary', 'field_area_m2', 'entry_point', 'exit_point',
+                    'unload_points', 'unload_point', 'entry_point_locked',
+                    'exit_point_locked', 'unload_point_locked', 'workflow_step',
+                    'inference_done', 'mask_processed', 'auto_path_planned',
+                    'auto_path_valid', 'auto_path_desc', 'auto_path_geo',
+                    'path_points', 'path_status', 'simulation_done', 'export_done',
+                    'turn_strategy', 'current_model_name', 'current_model_path',
+                    'last_total_path_m', 'last_work_path_m', 'last_turn_path_m',
+                    'last_entry_exit_path_m', 'last_harvest_rate',
+                    'last_planned_harvest_rate', 'last_detected_harvest_rate',
+                    'last_rolling_rate', 'last_field_efficiency',
+                )
+            }
+            restored_state['harvester_params'] = self._effective_harvester_params(
+                saved.get('harvester_params') or {}
+            )
+            self.state.safe_update(**restored_state)
+            self.log_panel.info("已恢复最近项目；任务状态将按实际缓存内容同步")
+
+            self._service_points_visible = bool(saved.get('auto_path_planned') and processed_cache_valid)
+
+            if raw_mask is not None:
+                self.state.mask_raw = raw_mask
+                self.state.inference_original_mask = raw_mask
+                self.state.mask_offset_x = raw_ox
+                self.state.mask_offset_y = raw_oy
+                self.state.inference_done = True
+
+            if saved.get('field_boundary'):
+                self._draw_field_boundary()
+                self.task_panel.set_task_status("import_img", "done")
+                self.task_panel.set_task_status("draw_field", "done")
+
+            if saved.get('inference_done') and raw_mask is not None:
+                self.task_panel.set_task_status("segment", "done")
+                self.task_panel.set_task_action("segment", "\u91cd\u8dd1")
+                if not processed_cache_valid:
+                    self.state.mask_processed = False
+                    self.state.mask_result = None
+                    self._sync_task_statuses()
+                    self._show_mask_overlay(raw_mask)
+                    if saved.get('mask_processed'):
+                        self.log_panel.info("掩膜处理缓存版本已过期，请重新执行掩膜处理")
+            elif saved.get('inference_done'):
+                self.state.inference_done = False
+                self._sync_task_statuses()
+                self.log_panel.error("未找到缓存的 AI 掩膜，请重新运行 AI 识别")
+
+            if processed_cache_valid:
+                if processed_mask is not None:
+                    mr = saved.get("mask_result") or {}
+                    if isinstance(mr, dict):
+                        mr = dict(mr)
+                        mr["processed_mask"] = processed_mask
+                        self.state.mask_result = mr
+                    self.state.mask_offset_x = proc_ox
+                    self.state.mask_offset_y = proc_oy
+                    self.state.mask_processed = True
+                    self.task_panel.set_task_status("process", "done")
+                    self.task_panel.set_task_action("process", "\u91cd\u505a")
+                else:
+                    self.state.mask_processed = False
+                    self.state.mask_result = None
+                    self._sync_task_statuses()
+                    self.log_panel.error("未找到缓存的掩膜处理结果，请重新执行掩膜处理")
+
+            if self.state.mask_processed:
+                self._suggest_service_points()
+                self._service_points_visible = True
+                self._refresh_service_points_panel()
+            if saved.get('auto_path_planned'):
+                restored_path = self._restore_cached_path_geometry(saved)
+                if restored_path:
+                    self.route_info.update_route(restored_path, restored_path.get("validation", {}))
+            if saved.get('auto_path_planned') and self.state.mask_processed:
+                self.task_panel.set_task_status("plan", "done")
+            if self._pipeline_result is None and saved.get('auto_path_planned'):
+                self._log.info("cached path state restored without full path geometry")
+        except Exception as e:
+            self._log.info(f"cache restore failed: {e}")
+
+    def _on_save_project(self):
+        if not self._tif_path:
+            QMessageBox.information(self, "保存项目", "请先打开影像或项目。")
+            return
+        try:
+            from cache import save_project_state, wait_for_project_state_saves
+            save_project_state(self._tif_path, self.state, stage="manual_save")
+            wait_for_project_state_saves(self._tif_path, timeout=2.0)
+            self.log_panel.success("项目已保存")
+            self.lbl_status.setText("项目已保存")
+        except Exception as e:
+            self.log_panel.error(f"项目保存失败: {e}")
+            QMessageBox.warning(self, "项目保存失败", str(e))
+
+    def _on_open_tif(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开影像", "", "GeoTIFF (*.tif *.tiff);;TIFF (*.tif);;All files (*)")
+        if path:
+            self._load_tif_path(path)
+
+    def _on_load_model(self):
+        path, _ = QFileDialog.getOpenFileName(self, "加载模型", "", "PyTorch (*.pt);;All files (*)")
+        if path:
+            self._on_load_model_at(path)
+
+    @staticmethod
+    def _model_display_name(model):
+        path = model.get("path", "") if isinstance(model, dict) else str(model or "")
+        raw_name = model.get("name", "") if isinstance(model, dict) else ""
+        base = os.path.basename(path or raw_name)
+        if os.path.basename(os.path.dirname(path)).lower() == "weights":
+            run_name = os.path.basename(os.path.dirname(os.path.dirname(path)))
+            parent_name = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+            if run_name and run_name.lower() in ("w", "weights") and parent_name:
+                run_name = parent_name
+            if run_name:
+                return f"{run_name} · {base}"
+        return raw_name or base or path
+
+    def _custom_model_list(self):
+        items = self.cfg._raw.get("models", {}).get("custom", [])
+        clean = []
+        seen = set()
+        for item in items if isinstance(items, list) else []:
+            path = item.get("path", "") if isinstance(item, dict) else str(item or "")
+            if not path or path in seen or not os.path.isfile(path):
+                continue
+            seen.add(path)
+            clean.append({"name": item.get("name") or self._model_display_name({"path": path}), "path": path})
+        return clean
+
+    def _persist_custom_models(self):
+        builtin_paths = {m.get("path") for m in self._builtin_model_list()}
+        custom = []
+        seen = set()
+        for model in self._model_list:
+            path = model.get("path", "")
+            if not path or path in builtin_paths or path in seen:
+                continue
+            seen.add(path)
+            custom.append({"name": model.get("name") or self._model_display_name(model), "path": path})
+        self.cfg._raw.setdefault("models", {})["custom"] = custom
+        cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+        save_json_atomic(cfg_path, self.cfg._raw)
+
+    def _on_model_combo_changed(self, model_path_or_name):
+        if model_path_or_name == "__IMPORT_MODEL_FOLDER__" or model_path_or_name == "导入模型文件夹...":
+            self._on_import_model_folder()
+            return
+        matches = []
+        for m in self._model_list:
+            path = m.get("path", "")
+            name = m.get("name", os.path.basename(path))
+            base = os.path.basename(path)
+            if model_path_or_name in (name, path, base):
+                matches.append(m)
+        if len(matches) == 1:
+            self._on_load_model_at(matches[0].get("path", ""))
+        elif len(matches) > 1:
+            self.log_panel.error(f"模型名称存在多个匹配: {model_path_or_name}")
+        elif os.path.isfile(model_path_or_name):
+            self._on_load_model_at(model_path_or_name)
+
+    def _merge_model_list(self, models):
+        existing = {m.get("path") for m in self._model_list}
+        added = []
+        for model in models or []:
+            path = model.get("path", "") if isinstance(model, dict) else str(model)
+            if not path or path in existing:
+                continue
+            name = self._model_display_name(model if isinstance(model, dict) else {"path": path})
+            item = {"name": name, "path": path}
+            self._model_list.append(item)
+            existing.add(path)
+            added.append(item)
+        if added:
+            self._persist_custom_models()
+            self.top_toolbar.populate_models([m.get("name") for m in self._model_list])
+            self.task_panel.set_model_options(self._model_list, self.state.current_model_path)
+        return added
+
+    def _on_import_model_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择模型文件夹", "")
+        if not folder:
+            self.task_panel.set_model_options(self._model_list, self.state.current_model_path)
+            return
+        found = scan_model_dir(folder)
+        if not found:
+            QMessageBox.information(self, "未找到模型", "所选文件夹及其子文件夹中没有找到 .pt 模型文件。")
+            self.task_panel.set_model_options(self._model_list, self.state.current_model_path)
+            return
+        from pyside6_app.dialogs import ModelImportDialog
+        dlg = ModelImportDialog(found, self, best_only=True)
+        if dlg.exec() == QDialog.Accepted:
+            added = self._merge_model_list(dlg.selected_models)
+            self.log_panel.success(f"已加入 {len(added)} 个模型")
+            if added:
+                self._on_load_model_at(added[0].get("path", ""))
+        self.task_panel.set_model_options(self._model_list, self.state.current_model_path)
+
+    def _on_model_dropdown_open(self):
+        self._refresh_builtin_models()
+
+    def _on_model_manager(self):
+        models = self._model_list or self._refresh_builtin_models()
+        cur = getattr(self.state, 'current_model_path', None)
+        dlg = ModelManagerDialog(models, cur or "", self)
+        if dlg.exec() == QDialog.Accepted and dlg.selected_path:
+            self._merge_model_list([{"name": self._model_display_name({"path": dlg.selected_path}), "path": dlg.selected_path}])
+            self._on_load_model_at(dlg.selected_path)
+
+    def _on_load_model_at(self, path):
+        if not path or not os.path.isfile(path):
+            self.log_panel.error(f"模型文件不存在: {path}")
+            return False
+        try:
+            builtin_root = os.path.abspath(self._builtin_model_dir())
+            external_model = os.path.commonpath(
+                [builtin_root, os.path.abspath(path)]
+            ) != builtin_root
+        except ValueError:
+            external_model = True
+        if external_model and QMessageBox.question(
+            self,
+            "外部模型安全确认",
+            "PyTorch .pt 文件可能包含可执行的序列化内容。仅应加载由你训练或来源可信的模型。\n\n"
+            f"文件：{os.path.abspath(path)}\n\n确认信任并继续加载吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            self.log_panel.info("已取消加载未经确认的外部模型")
+            return False
+        try:
+            previous_path = str(getattr(self.state, 'current_model_path', '') or '')
+            if not self.model_engine.load(path):
+                self.log_panel.error("模型加载失败")
+                return False
+            name = os.path.basename(path)
+            if path != getattr(self.state, 'current_model_path', ''):
+                self._save_system_undo("加载模型")
+            self.top_toolbar.set_model_name(name)
+            self.top_toolbar.set_current_model(name)
+            self.task_panel.set_model_path(name)
+            self.state.current_model_name = name
+            self.state.current_model_path = path
+            if previous_path and os.path.abspath(previous_path) != os.path.abspath(path):
+                self._invalidate_analysis_from(
+                    "inference",
+                    "识别模型已变化，旧识别掩膜和路径不能继续使用",
+                )
+            self.log_panel.success(f"模型加载: {name}")
+            return True
+        except Exception as e:
+            self.log_panel.error(f"模型加载失败: {e}")
+            return False
+    def _on_toolbar_action(self, aid):
+        H = {
+            "OPEN": self._on_open_tif,
+            "MODEL": self._on_load_model,
+            "AI_INFER": self._on_segment,
+            "MASK_PROCESS": self._on_mask_process,
+            "PARAMS": self._on_params_dialog,
+            "ENTRY_EXIT": self._on_toggle_entry_exit,
+            "TURN_STRATEGY": self._on_turn_strategy_btn,
+            "PLAN": self._on_plan,
+            "PLAY": self._on_toggle_animation,
+            "EXPORT": self._on_export_geojson,
+            "SETTINGS": self._on_settings_dialog,
+            "UNDO": self._on_undo,
+            "REDO": self._on_redo,
+            "CANCEL_TASK": self._cancel_background_worker,
+        }
+        h = H.get(aid)
+        if h:
+            h()
+
+    def _on_tool_changed(self, t):
+        self.log_panel.info(f"当前工具: {t}")
+
+    def _save_system_undo(self, label):
+        """Record a user-visible system operation for global undo/redo."""
+        self.state.save_undo(label)
+        self.top_toolbar.refresh_actions(self.state)
+
+    def _on_undo(self):
+        if self.state.undo():
+            self.log_panel.info("已撤销")
+            self._restore_visual_from_state()
+            self._sync_task_statuses()
+            self.top_toolbar.refresh_actions(self.state)
+        else:
+            self.log_panel.info("没有可撤销操作")
+            self.top_toolbar.refresh_actions(self.state)
+
+    def _on_redo(self):
+        if self.state.redo():
+            self.log_panel.info("已重做")
+            self._restore_visual_from_state()
+            self._sync_task_statuses()
+            self.top_toolbar.refresh_actions(self.state)
+        else:
+            self.log_panel.info("没有可重做操作")
+            self.top_toolbar.refresh_actions(self.state)
+
+    def _restore_visual_from_state(self):
+        self.top_toolbar.refresh_actions(self.state)
+        path_result = (self._pipeline_result or {}).get("path", {})
+        if getattr(self.state, 'auto_path_planned', False) and path_result:
+            self._show_path(path_result)
+            return
+        result = getattr(self.state, 'mask_result', None)
+        if isinstance(result, dict) and isinstance(result.get("processed_mask"), np.ndarray):
+            self._show_mask_overlay(result["processed_mask"])
+            return
+        raw = getattr(self.state, 'mask_raw', None)
+        if isinstance(raw, np.ndarray):
+            self._show_mask_overlay(raw)
+            return
+        if self._tif_rgb is not None:
+            self.image_view.set_image(self._tif_rgb)
+        self._redraw_field_if_any()
+
+    @Slot(str)
+    def _on_step_deleted(self, tid):
+        """Rollback a workflow step after an explicit user confirmation."""
+        if tid not in TASK_ORDER:
+            return
+        label = TASK_LABELS.get(tid, tid)
+        if QMessageBox.question(
+            self,
+            f"确认回退“{label}”",
+            rollback_summary(tid),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self._rollback_from_task(tid)
+
+    def _rollback_from_task(self, tid):
+        try:
+            idx = TASK_ORDER.index(tid)
+        except ValueError:
+            return
+        self.state.save_undo(f"rollback {tid}")
+        affected = set(TASK_ORDER[idx:])
+
+        if "import_img" in affected:
+            self._tif_rgb = None
+            self._tif_path = None
+            self._tif_source_identity = {}
+            self._pipeline_result = None
+            self.state.tif_path = ""
+            self.state.img_h = 0
+            self.state.img_w = 0
+            self.state.display_h = 0
+            self.state.display_w = 0
+            self.state.downsample_factor = 1
+            self.state.display_scale_x = 1.0
+            self.state.display_scale_y = 1.0
+            self.state.field_boundary = []
+            self.state.mask_raw = None
+            self.state.inference_original_mask = None
+            self.state.mask_result = None
+            self.state.inference_done = False
+            self.state.mask_processed = False
+            self._field_pts.clear()
+            self.geo.clear()
+            self.top_toolbar.set_filename("")
+            self.image_view.clear_image()
+        elif "draw_field" in affected:
+            self.state.field_boundary = []
+            self._field_pts.clear()
+            self._field_drawing = False
+            self._sync_drawing_mode()
+            self.state.inference_done = False
+            self.state.mask_raw = None
+            self.state.inference_original_mask = None
+            self.state.mask_processed = False
+            self.state.mask_result = None
+            self._pipeline_result = None
+        elif "segment" in affected:
+            self.state.inference_done = False
+            self.state.mask_raw = None
+            self.state.inference_original_mask = None
+            self.state.mask_processed = False
+            self.state.mask_result = None
+            self._pipeline_result = None
+        elif "process" in affected:
+            self.state.mask_processed = False
+            self.state.mask_result = None
+
+        if "params" in affected:
+            self.state.harvester_params = {}
+        if "entry" in affected:
+            self.state.entry_point = None
+            self.state.entry_point_locked = False
+        if "exit" in affected:
+            self.state.exit_point = None
+            self.state.exit_point_locked = False
+        if "unload" in affected:
+            self.state.unload_points = []
+            self.state.unload_point = None
+            self.state.unload_point_locked = False
+        if "plan" in affected:
+            self.state.auto_path_planned = False
+            self.state.auto_path = []
+            self.state.auto_path_segments = []
+            self.state.auto_path_geo = []
+            self.state.auto_path_valid = False
+            self.state.auto_path_desc = ""
+            self.state.path_points = []
+            self.state.path_status = []
+            self._pipeline_result = None
+            self.route_info.clear_info()
+        if "simulate" in affected:
+            if self._anim_timer:
+                self._anim_timer.stop()
+            self._anim_timer = None
+            self._anim_engine = None
+            self.state.anim_active = False
+            self.state.anim_paused = False
+            self.state.simulation_done = False
+        if "export" in affected:
+            self.state.export_done = False
+
+        if tid != "import_img":
+            self._service_points_visible = bool(
+                getattr(self.state, 'entry_point', None)
+                or getattr(self.state, 'exit_point', None)
+                or getattr(self.state, 'unload_points', None)
+            )
+            self._restore_visual_from_state()
+            self._refresh_service_points_panel()
+        self._sync_task_statuses()
+        self.top_toolbar.refresh_actions(self.state)
+        self.log_panel.info(f"已回退到“{TASK_LABELS.get(tid, tid)}”之前")
+
+
+    def _sync_task_statuses(self):
+        """Render task panel from the actual domain state (single source of truth)."""
+        statuses = derive_task_statuses(self.state, has_image=self._tif_rgb is not None)
+        self.task_panel.apply_task_statuses(statuses)
+
+    def _invalidate_analysis_from(self, stage, reason=""):
+        """Invalidate every result derived from a changed scientific input."""
+        stage = str(stage or "path")
+        if stage not in {"inference", "mask", "path"}:
+            raise ValueError(f"unknown invalidation stage: {stage}")
+
+        updates = {}
+        if stage == "inference":
+            updates.update(
+                mask_raw=None,
+                inference_original_mask=None,
+                inference_done=False,
+                workflow_step=0,
+            )
+        if stage in {"inference", "mask"}:
+            updates.update(
+                mask_processed=False,
+                mask_result=None,
+                entry_point=None,
+                exit_point=None,
+                unload_points=[],
+                unload_point=None,
+                entry_point_locked=False,
+                exit_point_locked=False,
+                unload_point_locked=False,
+                workflow_step=0 if stage == "inference" else 1,
+            )
+            self._service_points_visible = False
+
+        updates.update(
+            auto_path=[],
+            auto_path_segments=[],
+            auto_path_geo=[],
+            auto_path_planned=False,
+            auto_path_valid=False,
+            auto_path_desc="",
+            path_points=[],
+            path_status=[],
+            simulation_done=False,
+            export_done=False,
+            last_total_path_m=0.0,
+            last_work_path_m=0.0,
+            last_turn_path_m=0.0,
+            last_entry_exit_path_m=0.0,
+        )
+        if stage == "path":
+            updates["workflow_step"] = min(int(getattr(self.state, "workflow_step", 2)), 2)
+
+        if self._anim_timer:
+            self._anim_timer.stop()
+        self._anim_timer = None
+        self._anim_engine = None
+        self.state.safe_update(**updates)
+        self._pipeline_result = None
+        self.route_info.clear_info()
+        self._sync_task_statuses()
+        if reason:
+            self.log_panel.info(f"已使下游结果失效：{reason}")
+
+    def _on_mask_strength_changed(self, strength_key):
+        strength_key = str(strength_key or "standard")
+        if strength_key == self._mask_processing_strength:
+            return
+        labels = {
+            "light": "轻量/快速",
+            "standard": "标准",
+            "strong": "增强",
+            "very_strong": "强力",
+        }
+        self._mask_processing_strength = strength_key
+        self.cfg._raw.setdefault("mask_processing", {})["strength"] = strength_key
+        cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+        save_json_atomic(cfg_path, self.cfg._raw)
+        self.task_panel.set_mask_strength(strength_key)
+        if getattr(self.state, 'mask_processed', False):
+            self._invalidate_analysis_from(
+                "mask",
+                f"掩膜处理强度已切换为 {labels.get(strength_key, strength_key)}，必须重新处理",
+            )
+        else:
+            self.log_panel.info(f"掩膜处理强度: {labels.get(strength_key, strength_key)}")
+
+    def _on_turn_strategy_changed(self, strategy_key):
+        if strategy_key == getattr(self.state, 'turn_strategy', None):
+            return
+        self._save_system_undo("切换调头方式")
+        had_path = bool(getattr(self.state, 'auto_path_planned', False))
+        self.state.turn_strategy = strategy_key
+        labels = {
+            "auto": "自动推荐",
+            "bow": "弓形调头",
+            "semicircle": "半圆调头",
+            "pear": "梨形调头",
+            "fishtail": "鱼尾折返",
+            "alpha": "紧凑 Alpha",
+        }
+        self.task_panel.set_turn_strategy(strategy_key)
+        self.top_toolbar.set_current_strategy(strategy_key)
+        if had_path:
+            self._invalidate_analysis_from(
+                "path",
+                f"调头方式已切换为 {labels.get(strategy_key, strategy_key)}，必须重新规划",
+            )
+        else:
+            self.log_panel.info(f"调头方式: {labels.get(strategy_key, strategy_key)}")
+
+    def _on_turn_strategy_btn(self):
+        strategies = ["自动", "弓形", "半圆", "梨形", "鱼尾", "Alpha"]
+        keys = ["auto", "bow", "semicircle", "pear", "fishtail", "alpha"]
+        cur_key = getattr(self.state, 'turn_strategy', 'auto')
+        cur_idx = keys.index(cur_key) if cur_key in keys else 0
+        item, ok = QInputDialog.getItem(self, "转弯策略", "请选择转弯策略:", strategies, cur_idx, False)
+        if ok and item:
+            idx = strategies.index(item)
+            self._on_turn_strategy_changed(keys[idx])
+
+    def _on_toggle_field_drawing(self):
+        self._field_drawing = not self._field_drawing
+        self._sync_drawing_mode()
+        if self._field_drawing:
+            self._field_pts = []
+            self.log_panel.info("田块圈选模式：点击添加顶点，点击首点闭合")
+        else:
+            self._field_pts = []
+            self._clear_field_overlay()
+            self.log_panel.info("已关闭田块圈选")
+    def _on_viewer_mouse_pressed(self, x, y, button):
+        if self._measure_tool and self._handle_measure_click(x, y, button):
+            return
+        if self._route_edit_active and self._handle_route_edit_press(x, y, button):
+            return
+        if self._field_drawing:
+            if button == 1:
+                if len(self._field_pts) >= 3:
+                    first = self._field_pts[0]
+                    close_r = max(14, self._field_vertex_radius() + 4)
+                    if math.hypot(x - first[0], y - first[1]) <= close_r:
+                        self._finish_field_polygon()
+                        return
+                self._field_pts.append((x, y))
+                self._redraw_field_overlay()
+            elif button == 2:
+                self._field_pts = []
+                self._clear_field_overlay()
+                self.log_panel.info("已取消田块圈选")
+            return
+        if getattr(self.state, 'entry_exit_mode', False):
+            if button == 1:
+                self._place_entry_exit_point(x, y)
+            return
+        self.event_bridge.on_mouse_pressed(x, y, button)
+
+    def _on_viewer_mouse_released(self, x, y, button):
+        if self._route_edit_active and self._route_drag_idx >= 0:
+            self._route_drag_idx = -1
+            return
+        self.event_bridge.on_mouse_released(x, y, button)
+
+    def _on_field_double_click(self, x, y):
+        return
+
+    def _on_viewer_mouse_moved(self, x, y, buttons):
+        if self._route_edit_active and self._route_drag_idx >= 0 and (buttons & 1):
+            self._route_edit_move_point(self._route_drag_idx, (x, y), save_undo=False)
+            self._draw_route_edit_overlay()
+            return
+        if self._field_drawing and self._field_pts:
+            self._redraw_field_overlay(mouse_pos=(x, y))
+        self.event_bridge.on_mouse_moved(x, y, buttons)
+
+    def _field_line_width(self):
+        return 4
+
+    def _field_vertex_radius(self):
+        return 7
+
+    def _redraw_field_overlay(self, mouse_pos=None):
+        viewer = self.image_view.viewer
+        viewer.clear_overlays()
+        pts = self._field_pts
+        lw = self._field_line_width()
+        vr = self._field_vertex_radius()
+        for i in range(len(pts) - 1):
+            viewer.draw_line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
+                             color=(0, 200, 80), width=lw)
+        if mouse_pos and pts:
+            viewer.draw_line(pts[-1][0], pts[-1][1], mouse_pos[0], mouse_pos[1],
+                             color=(0, 200, 80), width=max(3, lw // 2), style=Qt.DashLine)
+        for i, (px, py) in enumerate(pts):
+            c = (255, 255, 0) if i == 0 else (0, 200, 80)
+            viewer.draw_circle(px, py, radius=vr, color=c)
+
+    def _clear_field_overlay(self):
+        self.image_view.viewer.clear_overlays()
+
+    def _finish_field_polygon(self):
+        if len(self._field_pts) < 3:
+            self.log_panel.error("至少需要 3 个点")
+            return
+        area_m2 = self._field_area_m2(self._field_pts)
+        self._save_system_undo("田块圈选")
+        self.state.safe_update(field_boundary=list(self._field_pts), field_area_m2=area_m2)
+        self._field_drawing = False
+        self._sync_drawing_mode()
+        self._draw_field_boundary()
+        area_info = self._estimate_field_area(self._field_pts)
+        self.log_panel.success(f"田块已设置: {len(self._field_pts)} 个顶点 | 面积 = {area_info}")
+        self._journal.info(f"田块已设置: {len(self._field_pts)} 个顶点, 面积={area_info}")
+        self.task_panel.set_task_status("draw_field", "done")
+        self._sync_task_statuses()
+        WorkflowUpdater.advance(self.state, "BOUNDARY_SET")
+
+    @staticmethod
+    def _polygon_area_px(pts):
+        n = len(pts)
+        area = 0.0
+        for i in range(n):
+            j = (i + 1) % n
+            area += pts[i][0] * pts[j][1]
+            area -= pts[j][0] * pts[i][1]
+        return abs(area) / 2.0
+
+    def _estimate_field_area(self, pts):
+        area_px = self._polygon_area_px(pts)
+        if self.geo.is_ready():
+            area_m2 = self._field_area_m2(pts)
+            if area_m2 > 0:
+                if area_m2 >= 10000:
+                    return f"{area_m2 / 10000:.2f} ha ({area_m2:.0f} m2)"
+                return f"{area_m2:.1f} m2"
+        return f"{area_px:.0f} px2"
+
+    def _field_area_m2(self, pts):
+        if not pts or len(pts) < 3:
+            return 0.0
+        if self.geo.is_ready():
+            try:
+                area_m2 = float(self.geo.pixel_polygon_area_m2(pts))
+                if math.isfinite(area_m2) and area_m2 > 0:
+                    return area_m2
+            except Exception:
+                pass
+            try:
+                arr = np.asarray(pts, dtype=np.float64)
+                cx, cy = np.mean(arr[:, 0]), np.mean(arr[:, 1])
+                ppm = self.geo.pixels_per_meter(cx, cy)
+                if ppm > 0:
+                    return self._polygon_area_px(pts) / (ppm * ppm)
+            except Exception:
+                pass
+        return 0.0
+
+    def _draw_field_boundary(self):
+        boundary = getattr(self.state, 'field_boundary', [])
+        if not boundary or len(boundary) < 3:
+            return
+        viewer = self.image_view.viewer
+        viewer.clear_overlays()
+        lw = self._field_line_width()
+        vr = self._field_vertex_radius()
+        for i in range(len(boundary)):
+            p1 = boundary[i]
+            p2 = boundary[(i + 1) % len(boundary)]
+            viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(0, 255, 100), width=lw)
+        for px, py in boundary:
+            viewer.draw_circle(px, py, radius=vr, color=(255, 255, 0))
+
+    def _redraw_field_if_any(self):
+        boundary = getattr(self.state, 'field_boundary', [])
+        if boundary and len(boundary) >= 3:
+            self._draw_field_boundary()
+
+    def _draw_service_points_overlay(self, clear_first=False):
+        viewer = self.image_view.viewer
+        if clear_first:
+            viewer.clear_overlays()
+        if not self._service_points_should_show():
+            return
+        points = []
+        ep = getattr(self.state, 'entry_point', None)
+        xp = getattr(self.state, 'exit_point', None)
+        if ep:
+            points.append((ep, "起点", (0, 255, 80)))
+        if xp:
+            points.append((xp, "终点", (255, 80, 80)))
+        for index, point in enumerate(list(getattr(self.state, 'unload_points', []) or []), start=1):
+            points.append((point, f"卸粮点{index}", (255, 210, 40)))
+        for point, label, color in points:
+            x, y = float(point[0]), float(point[1])
+            viewer.draw_circle(x, y, radius=8, color=color)
+            viewer.draw_text(x + 12, y - 16, label, color=color, size=12)
+
+    def _service_points_should_show(self):
+        return bool(
+            self._service_points_visible
+            or getattr(self.state, 'entry_exit_mode', False)
+            or getattr(self.state, 'auto_path_planned', False)
+        )
+
+    def _refresh_service_points_panel(self):
+        if not self._service_points_should_show():
+            self.route_info.update_service_points(None, None, [])
+            return
+        entry = getattr(self.state, 'entry_point', None)
+        exit_point = getattr(self.state, 'exit_point', None)
+        unload_points = list(getattr(self.state, 'unload_points', []) or [])
+        if not (entry or exit_point or unload_points):
+            self.route_info.clear_info()
+            return
+        self.route_info.update_service_points(entry, exit_point, unload_points)
+
+    def _on_service_point_selected(self, kind, index):
+        point = None
+        if kind == "entry":
+            point = getattr(self.state, 'entry_point', None)
+        elif kind == "exit":
+            point = getattr(self.state, 'exit_point', None)
+        elif kind == "unload":
+            points = list(getattr(self.state, 'unload_points', []) or [])
+            if 0 <= index < len(points):
+                point = points[index]
+        if not point:
+            return
+        self._draw_service_points_overlay(clear_first=False)
+        self.image_view.viewer.draw_circle(float(point[0]), float(point[1]), radius=13, color=(0, 220, 255))
+
+    def _constrain_point_to_field(self, point):
+        boundary = getattr(self.state, 'field_boundary', None)
+        if not boundary or len(boundary) < 3:
+            return (float(point[0]), float(point[1]))
+        poly = np.asarray(boundary, dtype=np.float32)
+        pt = (float(point[0]), float(point[1]))
+        if cv2.pointPolygonTest(poly, pt, False) >= 0:
+            return pt
+        vertices = np.asarray(boundary, dtype=np.float64)
+        distances = np.linalg.norm(vertices - np.asarray(pt, dtype=np.float64), axis=1)
+        nearest = vertices[int(np.argmin(distances))]
+        return (float(nearest[0]), float(nearest[1]))
+
+    def _suggest_service_points(self):
+        mask_result = getattr(self.state, 'mask_result', None) or {}
+        wide_bands = mask_result.get("wide_bands", [])
+        if len(wide_bands) < 2:
+            return
+        entry_pt = None
+        exit_pt = None
+        try:
+            from path_planner import prepare_band_centerlines
+            lines, _ = prepare_band_centerlines(
+                wide_bands,
+                float(mask_result.get("main_angle", 0.0) or 0.0),
+                geo=self.geo,
+                state=self.state,
+                config=dict(self.cfg._raw.get("path_planning", {})),
+            )
+            if lines:
+                first = lines[0]
+                last = lines[-1]
+                entry_local = np.asarray(first[0], dtype=np.float64)
+                entry_next = np.asarray(first[1], dtype=np.float64)
+                if (len(lines) - 1) % 2:
+                    exit_local = np.asarray(last[0], dtype=np.float64)
+                    exit_previous = np.asarray(last[1], dtype=np.float64)
+                else:
+                    exit_local = np.asarray(last[-1], dtype=np.float64)
+                    exit_previous = np.asarray(last[-2], dtype=np.float64)
+                ref_global = (
+                    float(entry_local[0]) + float(getattr(self.state, 'mask_offset_x', 0) or 0),
+                    float(entry_local[1]) + float(getattr(self.state, 'mask_offset_y', 0) or 0),
+                )
+                ppm = self.geo.pixels_per_meter(*ref_global) if self.geo.is_ready() else 1.0
+                approach_px = max(1.0, 1.0 * ppm)
+
+                def extend(endpoint, neighbor):
+                    direction = endpoint - neighbor
+                    norm = float(np.linalg.norm(direction))
+                    if norm <= 1e-9:
+                        return endpoint
+                    return endpoint + direction / norm * approach_px
+
+                entry_local = extend(entry_local, entry_next)
+                exit_local = extend(exit_local, exit_previous)
+                ox = float(getattr(self.state, 'mask_offset_x', 0) or 0)
+                oy = float(getattr(self.state, 'mask_offset_y', 0) or 0)
+                entry_pt = (float(entry_local[0]) + ox, float(entry_local[1]) + oy)
+                exit_pt = (float(exit_local[0]) + ox, float(exit_local[1]) + oy)
+        except Exception as exc:
+            self._log.info(f"service point suggestion failed: {exc}")
+        if entry_pt and (not getattr(self.state, 'entry_point', None) or not getattr(self.state, 'entry_point_locked', False)):
+            self.state.entry_point = self._constrain_point_to_field(entry_pt)
+        if exit_pt and (not getattr(self.state, 'exit_point', None) or not getattr(self.state, 'exit_point_locked', False)):
+            self.state.exit_point = self._constrain_point_to_field(exit_pt)
+
+    def _on_toggle_entry_exit(self):
+        self.state.entry_exit_mode = not getattr(self.state, 'entry_exit_mode', False)
+        self._sync_drawing_mode()
+        self._entry_exit_click_idx = 0
+        self.log_panel.info(f"起终点与卸粮点布设: {'开启' if self.state.entry_exit_mode else '关闭'}")
+        if self.state.entry_exit_mode:
+            self._service_points_visible = True
+            self._suggest_service_points()
+            result = getattr(self.state, 'mask_result', None) or {}
+            mask = result.get("processed_mask", getattr(self.state, 'mask_raw', None))
+            if mask is not None:
+                self._show_mask_overlay(mask)
+            else:
+                self._restore_visual_from_state()
+            self._refresh_service_points_panel()
+            self._sync_task_statuses()
+            self.log_panel.info("起点、终点会先按识别结果智能推荐；点击地图可按顺序覆盖起点、终点，之后继续点击新增卸粮点")
+        else:
+            self._restore_visual_from_state()
+        self.top_toolbar.set_action_active("ENTRY_EXIT", self.state.entry_exit_mode)
+
+    def _place_entry_exit_point(self, x, y):
+        self._service_points_visible = True
+        idx = self._entry_exit_click_idx
+        label = "设置起点" if idx == 0 else ("设置终点" if idx == 1 else "新增卸粮点")
+        self._save_system_undo(label)
+        if idx == 0:
+            self.state.safe_update(entry_point=(x, y), entry_point_locked=True)
+            self.log_panel.success(f"起点: ({x}, {y})")
+        elif idx == 1:
+            self.state.safe_update(exit_point=(x, y), exit_point_locked=True)
+            self.log_panel.success(f"终点: ({x}, {y})")
+        else:
+            pts = list(getattr(self.state, 'unload_points', []) or [])
+            pts.append((x, y))
+            self.state.safe_update(
+                unload_points=pts,
+                unload_point=pts[0] if pts else None,
+                unload_point_locked=True,
+            )
+            self.log_panel.success(f"卸粮点 #{len(pts)}: ({x}, {y})")
+        self._restore_visual_from_state()
+        self._refresh_service_points_panel()
+        self._sync_task_statuses()
+        self._entry_exit_click_idx += 1
+
+    def _on_segment(self):
+        if self._tif_rgb is not None and not self.model_engine.is_loaded() and not self._ensure_model_loaded():
+            QMessageBox.warning(self, "提示", "未找到内置模型，请检查 data/models")
+            return
+        if self._tif_rgb is None:
+            QMessageBox.warning(self, "提示", "请先加载影像")
+            return
+        if not self.model_engine.is_loaded():
+            QMessageBox.warning(self, "提示", "请先加载模型")
+            return
+        if getattr(self.state, 'inference_running', False):
+            QMessageBox.warning(self, "提示", "AI 识别正在运行")
+            return
+        self._save_system_undo("AI识别")
+        self._invalidate_analysis_from(
+            "inference",
+            "已开始新的 AI 识别，本次结果提交前不保留旧掩膜",
+        )
+        self.top_toolbar.set_progress(1, "AI 识别中...")
+        self.progress_bar.show()
+        self.progress_bar.setValue(5)
+        self.task_panel.set_task_status("segment", "in_progress", 5)
+        self.lbl_status.setText("AI 识别中...")
+
+        from model import InferenceRunner
+        runner = InferenceRunner(self.state, self.model_engine, self.geo)
+        runner.start_from_tif(
+            self._tif_path,
+            self._tif_rgb.shape[:2],
+            self.state.field_boundary,
+            max(1, int(getattr(self.state, 'downsample_factor', 1) or 1)),
+        )
+        self._pending_segment_display = True
+
+    def _on_plan(self):
+        mask_result = getattr(self.state, 'mask_result', None)
+        if mask_result is None:
+            QMessageBox.warning(self, "提示", "请先完成掩膜处理")
+            return
+        hp = self._effective_harvester_params(getattr(self.state, 'harvester_params', {}) or {})
+        self.state.harvester_params = hp
+        ep = getattr(self.state, 'entry_point', None)
+        xp = getattr(self.state, 'exit_point', None)
+        if not ep or not xp:
+            QMessageBox.warning(self, "缺少起点/终点", "请先设置或确认起点和终点。\n\n卸粮点是可选项，不影响路径规划。")
+            return
+        if not hp.get("cutter_width_m"):
+            QMessageBox.warning(self, "提示", "请先配置收割机参数")
+            return
+        if self._has_background_worker():
+            QMessageBox.warning(self, "任务正在运行", "当前已有耗时任务正在执行，请等待完成后再生成路径。")
+            return
+
+        try:
+            from pyside6_app.workers import require_metric_scale
+            require_metric_scale(
+                self.geo,
+                self.state,
+                mask_result.get("processed_mask").shape,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "地理尺度不可用", str(exc))
+            return
+
+        self._save_system_undo("路径规划")
+        self._invalidate_analysis_from(
+            "path",
+            "已开始新的路径规划，本次结果提交前不保留旧路径",
+        )
+        path_config = {
+            "min_turn_radius_m": hp.get("turn_radius_m", 1.0),
+            "turn_strategy": getattr(self.state, 'turn_strategy', 'auto'),
+        }
+        worker = PlanWorker(
+            mask_result,
+            self.geo,
+            self.state,
+            path_config,
+            detected_mask=getattr(self.state, 'inference_original_mask', None),
+        )
+        worker.finished.connect(self._on_plan_worker_done)
+        self.state.plan_running = True
+        self.state.plan_progress = 0.05
+        self.top_toolbar.set_progress(5, "路径规划中...")
+        self.progress_bar.show()
+        self.progress_bar.setValue(5)
+        self.task_panel.set_task_status("plan", "in_progress", 5)
+        self.lbl_status.setText("路径规划中...")
+        if not self._start_background_worker(worker, "路径规划已开始，可继续查看当前结果；完成后会自动刷新。"):
+            self.state.plan_running = False
+            self.state.plan_progress = 0.0
+            self.progress_bar.hide()
+            self.top_toolbar.set_progress(0)
+            self._sync_task_statuses()
+
+    def _on_run(self):
+        if self._tif_rgb is None:
+            QMessageBox.warning(self, "提示", "请先加载影像")
+            return
+        if not self.model_engine.is_loaded() and not self._ensure_model_loaded():
+            QMessageBox.warning(self, "提示", "请先加载模型")
+            return
+        self._on_segment()
+    @Slot(int, str)
+    def _on_progress(self, pct, msg):
+        self.progress_bar.setValue(pct); self.top_toolbar.set_progress(pct, msg); self.lbl_status.setText(msg)
+        if getattr(self.state, 'mask_processing_running', False):
+            self.state.mask_processing_progress = max(0.0, min(1.0, pct / 100.0))
+            self.task_panel.set_task_status("process", "in_progress", pct)
+        elif getattr(self.state, 'plan_running', False):
+            self.state.plan_progress = max(0.0, min(1.0, pct / 100.0))
+            self.task_panel.set_task_status("plan", "in_progress", pct)
+        elif pct < 30:
+            self.task_panel.set_task_status("segment", "in_progress", pct)
+        elif pct < 70:
+            self.task_panel.set_task_status("process", "in_progress", pct)
+        else:
+            self.task_panel.set_task_status("plan", "in_progress", pct)
+
+    @staticmethod
+    def _coerce_points(points):
+        clean = []
+        for point in points or []:
+            if hasattr(point, "pixel_x") and hasattr(point, "pixel_y"):
+                clean.append((float(point.pixel_x), float(point.pixel_y)))
+            elif len(point) >= 2:
+                clean.append((float(point[0]), float(point[1])))
+        return clean
+
+    @staticmethod
+    def _status_for_segment_type(segment_type):
+        if segment_type == "work":
+            return 1
+        if segment_type == "entry":
+            return 2
+        if segment_type == "exit":
+            return 3
+        if segment_type in ("turn_reverse", "turn_aux"):
+            return 4
+        return 0
+
+    @staticmethod
+    def _segment_length(points):
+        pts = MainWindow._coerce_points(points)
+        return sum(
+            math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+            for i in range(1, len(pts))
+        )
+
+    def _normalise_path_result(self, path_result):
+        if not isinstance(path_result, dict):
+            return {}
+        normalised = dict(path_result)
+        full_path = normalised.get("full_path") or []
+        segment_types = list(normalised.get("segment_types") or [])
+
+        if full_path:
+            tracks, turns, ordered = [], [], []
+            for index, raw_points in enumerate(full_path):
+                points = self._coerce_points(raw_points)
+                if len(points) < 2:
+                    continue
+                segment_type = (
+                    segment_types[index]
+                    if index < len(segment_types)
+                    else ("work" if index % 2 == 0 else "turn")
+                )
+                lengths_m = normalised.get("segment_lengths_m") or []
+                display_length = (
+                    float(lengths_m[index])
+                    if index < len(lengths_m)
+                    else self._segment_length(points)
+                )
+                item = {
+                    "points": points,
+                    "type": segment_type,
+                    "segment_index": index,
+                    "length": display_length,
+                }
+                ordered.append(item)
+                if segment_type == "work":
+                    tracks.append(item)
+                else:
+                    turns.append(item)
+            normalised["full_path"] = [item["points"] for item in ordered]
+            normalised["segment_types"] = [item["type"] for item in ordered]
+            normalised["tracks"] = tracks
+            normalised["turns"] = turns
+            normalised["ordered_segments"] = ordered
+        else:
+            tracks = normalised.get("tracks", [])
+            turns = normalised.get("turns", [])
+            normalised["ordered_segments"] = list(tracks) + list(turns)
+        return normalised
+
+    @staticmethod
+    def _path_result_point_count(path_result):
+        return sum(
+            len(segment.get("points", []) or [])
+            for segment in (path_result.get("ordered_segments", []) or [])
+            if isinstance(segment, dict)
+        )
+
+    def _geo_export_payload(self):
+        if not self.geo.is_ready():
+            raise ValueError("当前影像没有可用地理坐标，不能导出经纬度文件")
+        if self._tif_path and self._tif_source_identity:
+            from cache import source_identity
+            if source_identity(self._tif_path) != self._tif_source_identity:
+                raise ValueError("GeoTIFF 文件在加载后已发生变化，请重新打开影像并重新规划")
+        pr = self._pipeline_result or {}
+        path_result = self._normalise_path_result(pr.get("path", {}))
+        if not path_result.get("ordered_segments"):
+            raise ValueError("当前没有可导出的路径，请先生成路径")
+        validation = path_result.get("validation", {}) or {}
+        path_valid = bool(
+            path_result.get("is_valid", validation.get("valid", False))
+            and validation.get("valid", path_result.get("is_valid", False))
+        )
+        hard_reasons = list(
+            (path_result.get("turn_assessment", {}) or {}).get("hard_reasons") or []
+        )
+        if not path_valid or hard_reasons:
+            issues = list(validation.get("issues") or []) + hard_reasons
+            detail = "；".join(str(item) for item in issues[:5]) or "路径未经验证"
+            raise ValueError(f"路径未通过安全验证，禁止正式导出：{detail}")
+
+        planned_harvester = (
+            (path_result.get("planning_factors", {}) or {}).get("harvester", {}) or {}
+        )
+        if planned_harvester:
+            current_harvester = self._effective_harvester_params(
+                getattr(self.state, "harvester_params", {}) or {}
+            )
+            changed = [
+                key
+                for key, value in planned_harvester.items()
+                if key in current_harvester
+                and abs(float(value) - float(current_harvester[key])) > 1e-9
+            ]
+            if changed:
+                raise ValueError(
+                    "当前农机参数与路径规划时不一致，必须重新规划："
+                    + ", ".join(changed)
+                )
+        requested_strategy = path_result.get("requested_strategy")
+        if (
+            requested_strategy
+            and str(requested_strategy) != str(getattr(self.state, "turn_strategy", "auto"))
+        ):
+            raise ValueError("当前调头策略与路径规划时不一致，必须重新规划")
+        full_path = path_result.get("full_path", [])
+        segment_types = path_result.get("segment_types", [])
+        display_h, display_w = (
+            self._tif_rgb.shape[:2]
+            if isinstance(self._tif_rgb, np.ndarray)
+            else (
+                int(getattr(self.state, "display_h", 0) or 0),
+                int(getattr(self.state, "display_w", 0) or 0),
+            )
+        )
+        if display_w > 0 and display_h > 0:
+            for segment_index, segment in enumerate(full_path):
+                for point_index, (pixel_x, pixel_y) in enumerate(segment):
+                    if not (
+                        0.0 <= float(pixel_x) <= float(display_w - 1)
+                        and 0.0 <= float(pixel_y) <= float(display_h - 1)
+                    ):
+                        raise ValueError(
+                            "路径点超出影像范围，禁止使用仿射外推坐标: "
+                            f"segment={segment_index}, point={point_index}, "
+                            f"pixel=({float(pixel_x):.3f},{float(pixel_y):.3f})"
+                        )
+        expected_count = self._path_result_point_count(path_result)
+        from path_planner import global_path_to_geo, validate_geo_points
+
+        # Pixel geometry shown in the viewer is authoritative. Recompute at
+        # export time so stale cache data can never diverge from the route on
+        # screen, then validate every point's segment and pixel identity.
+        geo_points = global_path_to_geo(full_path, self.geo, segment_types)
+        geo_points = validate_geo_points(
+            geo_points,
+            expected_count=expected_count,
+            path_segments=full_path,
+            segment_types=segment_types,
+        )
+        path_result["geo_points"] = geo_points
+        result = dict(self._pipeline_result or {})
+        result["path"] = path_result
+        self._pipeline_result = result
+        self.state.auto_path_geo = geo_points
+        return path_result, geo_points
+
+    def _show_geo_export_error(self, label, error):
+        message = (
+            f"{label} 导出已停止。\n\n"
+            f"{error}\n\n"
+            "为避免田间试验使用错误坐标，请重新生成路径，或检查 GeoTIFF 坐标系后再导出。"
+        )
+        self.log_panel.error(message.replace("\n", " "))
+        QMessageBox.warning(self, f"{label} 导出失败", message)
+
+    @staticmethod
+    def _manifest_jsonable(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {
+                str(key): MainWindow._manifest_jsonable(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [MainWindow._manifest_jsonable(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _sha256_file(self, path, use_cache=True):
+        path = os.path.abspath(str(path or ""))
+        if not path or not os.path.isfile(path):
+            return ""
+        stat = os.stat(path)
+        key = (path, int(stat.st_size), int(stat.st_mtime_ns))
+        if use_cache and key in self._file_hash_cache:
+            return self._file_hash_cache[key]
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            while True:
+                block = handle.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+        value = digest.hexdigest()
+        if use_cache:
+            self._file_hash_cache[key] = value
+        return value
+
+    def _write_export_manifest(self, output_path, output_format, path_result, geo_points):
+        from importlib import metadata
+        from cache import source_identity
+
+        package_names = (
+            "numpy", "opencv-python", "PySide6", "pyproj",
+            "rasterio", "shapely", "ultralytics",
+        )
+        versions = {}
+        for package in package_names:
+            try:
+                versions[package] = metadata.version(package)
+            except metadata.PackageNotFoundError:
+                versions[package] = "not-installed"
+
+        config_data = self._manifest_jsonable(self.cfg._raw)
+        config_bytes = json.dumps(
+            config_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        route_data = self._manifest_jsonable(geo_points)
+        route_bytes = json.dumps(
+            route_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        model_path = str(getattr(self.state, "current_model_path", "") or "")
+        mask_result = getattr(self.state, "mask_result", None) or {}
+        diagnostics = mask_result.get("diagnostics", {}) if isinstance(mask_result, dict) else {}
+        extent = {}
+        if self.geo.is_ready() and isinstance(self._tif_rgb, np.ndarray):
+            try:
+                height, width = self._tif_rgb.shape[:2]
+                extent = self.geo.validate_raster_extent(width, height)
+            except Exception:
+                extent = {}
+
+        manifest = {
+            "schema": 1,
+            "created_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "output": {
+                "path": os.path.abspath(output_path),
+                "format": str(output_format),
+                "sha256": self._sha256_file(output_path, use_cache=False),
+                "point_count": len(geo_points),
+                "coordinate_crs": "EPSG:4326",
+            },
+            "source_image": {
+                "path": os.path.abspath(self._tif_path) if self._tif_path else "",
+                "identity": source_identity(self._tif_path) if self._tif_path else {},
+                "geographic_extent": extent,
+            },
+            "model": {
+                "name": str(getattr(self.state, "current_model_name", "") or ""),
+                "path": os.path.abspath(model_path) if model_path else "",
+                "sha256": self._sha256_file(model_path),
+            },
+            "analysis": {
+                "mask_algorithm_version": diagnostics.get("algorithm_version"),
+                "mask_strength": diagnostics.get("strength", self._mask_processing_strength),
+                "fallback_pipeline": bool(diagnostics.get("fallback_pipeline", False)),
+                "harvester_params": self._manifest_jsonable(
+                    getattr(self.state, "harvester_params", {}) or {}
+                ),
+                "turn_strategy": str(getattr(self.state, "turn_strategy", "")),
+                "validation": self._manifest_jsonable(
+                    path_result.get("validation", {}) or {}
+                ),
+                "planning_factors": self._manifest_jsonable(
+                    path_result.get("planning_factors", {}) or {}
+                ),
+            },
+            "integrity": {
+                "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+                "route_data_sha256": hashlib.sha256(route_bytes).hexdigest(),
+            },
+            "runtime": {
+                "python": sys.version,
+                "packages": versions,
+            },
+        }
+        manifest_path = str(output_path) + ".manifest.json"
+        try:
+            save_json_atomic(manifest_path, manifest)
+        except Exception:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+            raise
+        return manifest_path
+
+    def _auto_segments_from_path(self, path_result):
+        path_result = self._normalise_path_result(path_result)
+        segments = []
+        for index, points in enumerate(path_result.get("full_path", [])):
+            segment_type = path_result.get("segment_types", ["work"])[index]
+            pts = [PathPoint(float(x), float(y)) for x, y in self._coerce_points(points)]
+            if len(pts) < 2:
+                continue
+            lengths_m = path_result.get("segment_lengths_m") or []
+            length_m = (
+                float(lengths_m[index])
+                if index < len(lengths_m)
+                else self._segment_length(points)
+            )
+            segments.append(AutoPathSegment(
+                points=pts,
+                status=self._status_for_segment_type(segment_type),
+                corridor_id=index,
+                length_m=length_m,
+                segment_type=segment_type,
+            ))
+        return segments
+
+    def _restore_cached_path_geometry(self, saved):
+        """Rebuild in-memory route geometry from project_state.json cache."""
+        cached_segments = []
+        for index, item in enumerate(saved.get("auto_path") or []):
+            if not isinstance(item, dict):
+                continue
+            points = self._coerce_points(item.get("points") or [])
+            if len(points) < 2:
+                continue
+            segment_type = str(item.get("segment_type") or ("work" if index % 2 == 0 else "turn"))
+            cached_segments.append({
+                "points": points,
+                "type": segment_type,
+                "segment_index": index,
+                "length": self._segment_length(points),
+            })
+        if not cached_segments:
+            return {}
+        path_result = {
+            "full_path": [seg["points"] for seg in cached_segments],
+            "segment_types": [seg["type"] for seg in cached_segments],
+            "is_valid": bool(saved.get("auto_path_valid", False)),
+            "validation": {"valid": bool(saved.get("auto_path_valid", False))},
+            "description": saved.get("auto_path_desc", ""),
+            "geo_points": saved.get("auto_path_geo", []),
+        }
+        return self._store_path_result(path_result, {"path": path_result})
+
+    def _store_path_result(self, path_result, pipeline_result=None):
+        normalised = self._normalise_path_result(path_result)
+        if self.geo.is_ready() and normalised.get("full_path"):
+            from path_planner import global_path_to_geo
+            normalised["geo_points"] = global_path_to_geo(
+                normalised["full_path"],
+                self.geo,
+                normalised.get("segment_types", []),
+            )
+        elif not self.geo.is_ready():
+            normalised["geo_points"] = []
+        auto_segments = self._auto_segments_from_path(normalised)
+        flat_points, flat_status = [], []
+        for segment in auto_segments:
+            for point in segment.points:
+                point_tuple = (point.pixel_x, point.pixel_y)
+                if flat_points and math.hypot(point_tuple[0] - flat_points[-1][0], point_tuple[1] - flat_points[-1][1]) < 1e-6:
+                    flat_status[-1] = segment.status
+                    continue
+                flat_points.append(point_tuple)
+                flat_status.append(segment.status)
+
+        geo_points = normalised.get("geo_points", [])
+        validation = normalised.get("validation", {}) or {}
+        self.state.safe_update(
+            auto_path=auto_segments,
+            auto_path_segments=auto_segments,
+            auto_path_geo=geo_points,
+            auto_path_valid=bool(normalised.get("is_valid", validation.get("valid", False))),
+            auto_path_desc=normalised.get("description", ""),
+            auto_path_planned=bool(auto_segments),
+            path_points=flat_points,
+            path_status=flat_status,
+        )
+
+        result = dict(pipeline_result or self._pipeline_result or {})
+        result["path"] = normalised
+        self._pipeline_result = result
+        return normalised
+
+
+    TURN_STRATEGY_LABELS = {
+        "auto": "自动推荐",
+        "bow": "弓形调头",
+        "semicircle": "半圆调头",
+        "pear": "梨形调头",
+        "fishtail": "鱼尾折返",
+        "alpha": "紧凑 Alpha",
+    }
+
+    def _turn_strategy_label(self, path_result=None):
+        path_result = path_result or {}
+        assessment = path_result.get("turn_assessment", {}) if isinstance(path_result, dict) else {}
+        key = assessment.get("strategy") or path_result.get("requested_strategy") or getattr(self.state, 'turn_strategy', 'auto')
+        return assessment.get("label") or self.TURN_STRATEGY_LABELS.get(str(key), str(key))
+
+    def _log_turn_strategy_comparison(self, path_result):
+        validation = (path_result or {}).get("validation", {}) or {}
+        label = self._turn_strategy_label(path_result)
+        total = validation.get("total_length_m")
+        turn = validation.get("turn_length_m")
+        coverage = validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct"))
+        rolling = validation.get("track_core_overlap_pct", validation.get("rolling_crop_pct"))
+        parts = [f"[{label}]"]
+        if total is not None: parts.append(f"总长 {self._fmt_metric(total)}")
+        if turn is not None: parts.append(f"转弯 {self._fmt_metric(turn)}")
+        if coverage is not None: parts.append(f"覆盖 {self._fmt_metric(coverage, '%')}")
+        if rolling is not None: parts.append(f"碾压 {self._fmt_metric(rolling, '%')}")
+        self.log_panel.info("调头方式对比: " + " / ".join(parts))
+
+    @staticmethod
+    def _fmt_metric(value, suffix="m"):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return "--"
+        return f"{value:.1f}{suffix}"
+
+    def _path_quality_summary(self, path_result, bands_count=None, tracks_count=None, turns_count=None):
+        """Build a decision-oriented one-line summary for users after planning."""
+        path_result = self._normalise_path_result(path_result)
+        validation = path_result.get("validation", {}) or {}
+        tracks_count = len(path_result.get("tracks", [])) if tracks_count is None else tracks_count
+        turns_count = len(path_result.get("turns", [])) if turns_count is None else turns_count
+        parts = [f"路径规划完成: {tracks_count} 条作业线, {turns_count} 条转弯段", f"调头方式：{self._turn_strategy_label(path_result)}"]
+        total = validation.get("total_length_m", path_result.get("total_length_m"))
+        work = validation.get("work_length_m", path_result.get("work_length_m"))
+        turn = validation.get("turn_length_m", path_result.get("turn_length_m"))
+        coverage = validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct"))
+        rolling = validation.get("track_core_overlap_pct", validation.get("rolling_crop_pct"))
+        efficiency = validation.get("field_efficiency_pct", validation.get("field_efficiency"))
+        if total is not None:
+            parts.append(f"总长 {self._fmt_metric(total)}")
+        if work is not None:
+            parts.append(f"作业 {self._fmt_metric(work)}")
+        if turn is not None:
+            parts.append(f"转弯 {self._fmt_metric(turn)}")
+        if coverage is not None:
+            parts.append(f"覆盖率 {self._fmt_metric(coverage, '%')}")
+        if rolling is not None:
+            parts.append(f"碾压率 {self._fmt_metric(rolling, '%')}")
+        if efficiency is not None:
+            parts.append(f"效率 {self._fmt_metric(efficiency, '%')}")
+        issues = validation.get("issues") or []
+        if issues:
+            parts.append(f"风险 {len(issues)} 处")
+        return " | ".join(parts)
+
+    @Slot(str, object)
+    def _on_step_result(self, step, data):
+        if step == "segment_done":
+            self.task_panel.set_task_status("segment", "done")
+            self.task_panel.set_task_action("segment", "\u91cd\u8dd1")
+            if isinstance(data, np.ndarray):
+                self.state.safe_update(
+                    mask_raw=data,
+                    inference_original_mask=data,
+                    inference_done=True,
+                )
+                self._show_mask_overlay(data)
+            self._journal.info("AI 识别完成")
+            WorkflowUpdater.advance(self.state, "INFERENCE_DONE")
+        elif step == "process_done":
+            self.task_panel.set_task_status("process", "done")
+            self.task_panel.set_task_action("process", "\u91cd\u505a")
+            if isinstance(data, dict):
+                processed_mask = data.get("processed_mask")
+                self.state.safe_update(mask_processed=True, mask_result=data)
+                if isinstance(processed_mask, np.ndarray):
+                    self._show_mask_overlay(processed_mask)
+            elif isinstance(data, np.ndarray):
+                self._show_mask_overlay(data)
+            self._journal.info("掩膜处理完成")
+            self._suggest_service_points()
+            self._service_points_visible = True
+            self._draw_service_points_overlay(clear_first=False)
+            self._refresh_service_points_panel()
+            self._sync_task_statuses()
+            WorkflowUpdater.advance(self.state, "MASK_PROCESSED")
+        elif step == "mask" and isinstance(data, np.ndarray):
+            self._show_mask_overlay(data)
+
+    @Slot(dict)
+    def _on_pipeline_done(self, result):
+        result = dict(result or {})
+        if isinstance(result.get("mask"), np.ndarray):
+            self.state.safe_update(
+                mask_raw=result["mask"],
+                inference_original_mask=result["mask"],
+                inference_done=True,
+            )
+        if isinstance(result.get("processed"), dict):
+            self.state.safe_update(mask_processed=True, mask_result=result["processed"])
+        pr = self._store_path_result(result.get("path", {}), result)
+        self.top_toolbar.set_progress(0)
+        self.progress_bar.hide()
+        self.lbl_status.setText("就绪")
+        self._sync_task_statuses()
+        WorkflowUpdater.advance(self.state, "PATH_PLANNED")
+        if pr and self._tif_rgb is not None:
+            self._service_points_visible = True
+            self._show_path(pr)
+        tracks = len(pr.get("tracks", []))
+        turns = len(pr.get("turns", []))
+        bands = len(result.get("bands", []))
+        self.log_panel.success(self._path_quality_summary(pr, bands, tracks, turns))
+        self._log_turn_strategy_comparison(pr)
+        self.route_info.update_route(pr, pr.get("validation", {}))
+        self._journal.info(f"路径: {bands}条带 {tracks}作业线 {turns}转弯线")
+        validation = pr.get("validation", {})
+        if validation:
+            self._show_validation_report(pr, validation)
+            self._warn_path_validation_issues(pr)
+        QTimer.singleShot(0, lambda pr=pr: self._show_machine_recommendation(pr))
+
+    @Slot(str)
+    def _on_pipeline_error(self, msg):
+        self.top_toolbar.set_progress(0)
+        self.progress_bar.hide()
+        title, message = self._task_error_message(msg)
+        self.lbl_status.setText(title)
+        self.log_panel.error(f"{title}: {msg[:200]}")
+        for tid in ("segment", "process", "plan"):
+            w = self.task_panel._task_widgets.get(tid)
+            if w and w._in_progress:
+                self.task_panel.set_task_status(tid, "failed", text="失败")
+        QMessageBox.critical(self, title, message)
+
+    def _apply_mask_process_result(self, processed):
+        mask = getattr(self.state, 'mask_raw', None)
+        if processed is None:
+            self.log_panel.error("掩膜处理失败")
+            self.task_panel.set_task_status("process", "failed", text="失败")
+            QMessageBox.warning(self, "掩膜处理失败", "掩膜处理没有生成有效结果。\n\n请检查 AI 识别结果或重新圈选田块后重试。")
+            return
+        processed_mask = processed.get("processed_mask", mask)
+        wide_bands = processed.get("wide_bands", [])
+        processed = self._compact_mask_result_for_ui(processed)
+        processed_mask = processed.get("processed_mask", processed_mask)
+        self._save_processed_mask_async(processed_mask)
+        self.state.safe_update(mask_processed=True, mask_result=processed)
+        centers = [b for b in wide_bands if b.get("centerline")]
+        self.log_panel.success(f"掩膜处理完成: {len(wide_bands)} 条带, {len(centers)} 条中心线")
+        self.task_panel.set_task_status("process", "done")
+        self.task_panel.set_task_action("process", "\u91cd\u505a")
+        self._suggest_service_points()
+        self._service_points_visible = True
+        self._draw_service_points_overlay(clear_first=False)
+        self._refresh_service_points_panel()
+        self._sync_task_statuses()
+        WorkflowUpdater.advance(self.state, "MASK_PROCESSED")
+        self.lbl_status.setText("掩膜处理完成，正在刷新预览...")
+        QTimer.singleShot(50, lambda: self._show_mask_overlay(processed_mask))
+        QTimer.singleShot(80, lambda: self.lbl_status.setText("就绪"))
+
+    def _compact_mask_result_for_ui(self, processed):
+        """Remove dense per-band arrays before UI state/cache metadata saves."""
+        if not isinstance(processed, dict):
+            return processed
+        compact = dict(processed)
+        for key in ("wide_bands", "narrow_bands", "all_bands"):
+            items = []
+            for band in compact.get(key, []) or []:
+                if isinstance(band, dict):
+                    cleaned = {k: v for k, v in band.items() if k not in {"contour", "debug", "mask"}}
+                    items.append(cleaned)
+                else:
+                    items.append(band)
+            compact[key] = items
+        return compact
+
+    def _save_processed_mask_async(self, processed_mask):
+        """Persist the large processed mask off the GUI thread.
+
+        np.savez_compressed on a 15078×21021 uint8 mask can take several seconds
+        and runs after the worker reports 92–95%, which previously froze the
+        main window exactly when the algorithm had already completed.
+        """
+        tif_path = self._tif_path or getattr(self.state, 'tif_path', '')
+        if not tif_path or not isinstance(processed_mask, np.ndarray):
+            return
+        ox = int(getattr(self.state, 'mask_offset_x', 0) or 0)
+        oy = int(getattr(self.state, 'mask_offset_y', 0) or 0)
+        with self._processed_mask_save_lock:
+            self._processed_mask_save_generation += 1
+            generation = self._processed_mask_save_generation
+
+        def save_job():
+            try:
+                from cache import save_mask
+                def is_current_generation():
+                    with self._processed_mask_save_lock:
+                        return generation == self._processed_mask_save_generation
+                saved = save_mask(
+                    tif_path,
+                    processed_mask,
+                    ox,
+                    oy,
+                    suffix="_processed",
+                    commit_callback=is_current_generation,
+                )
+                if not saved:
+                    self._log.info("processed mask cache save skipped: superseded by newer result")
+            except Exception as e:
+                self._log.info(f"processed mask cache save failed: {e}")
+            finally:
+                current = threading.current_thread()
+                with self._processed_mask_save_lock:
+                    self._processed_mask_save_threads = [
+                        t for t in self._processed_mask_save_threads
+                        if t is not current and t.is_alive()
+                    ]
+
+        thread = threading.Thread(target=save_job, name="reui-save-processed-mask", daemon=True)
+        with self._processed_mask_save_lock:
+            self._processed_mask_save_threads.append(thread)
+        thread.start()
+
+    def _wait_processed_mask_saves(self, timeout_s=5.0):
+        deadline = time.time() + max(0.0, float(timeout_s))
+        while True:
+            with self._processed_mask_save_lock:
+                threads = [t for t in self._processed_mask_save_threads if t.is_alive()]
+                self._processed_mask_save_threads = threads
+            if not threads:
+                return True
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            threads[0].join(min(0.2, remaining))
+
+    def _on_mask_process(self):
+        mask = getattr(self.state, 'mask_raw', None)
+        if mask is None:
+            QMessageBox.warning(self, "提示", "请先完成 AI 识别")
+            return
+        if self._has_background_worker():
+            QMessageBox.warning(self, "任务正在运行", "当前已有耗时任务正在执行，请等待完成后再处理掩膜。")
+            return
+        try:
+            from pyside6_app.workers import require_metric_scale
+            require_metric_scale(self.geo, self.state, mask.shape)
+        except Exception as exc:
+            QMessageBox.warning(self, "地理尺度不可用", str(exc))
+            return
+        self._save_system_undo("掩膜处理")
+        self._invalidate_analysis_from(
+            "mask",
+            "已开始新的掩膜处理，本次结果提交前不保留旧处理结果和路径",
+        )
+        mask_config = dict(self.cfg._raw.get("mask_processing", {}))
+        mask_config["strength"] = self._mask_processing_strength
+        worker = MaskProcessWorker(mask, self.geo, self.state, mask_config)
+        worker.finished.connect(self._on_mask_worker_done)
+        self.state.mask_processing_running = True
+        self.state.mask_processing_progress = 0.05
+        self.top_toolbar.set_progress(5, "掩膜处理中...")
+        self.progress_bar.show()
+        self.progress_bar.setValue(5)
+        self.task_panel.set_task_status("process", "in_progress", 5)
+        self.lbl_status.setText("掩膜处理中...")
+        if not self._start_background_worker(worker, "掩膜处理已开始，完成后会自动推荐起点和终点。"):
+            self.state.mask_processing_running = False
+            self.state.mask_processing_progress = 0.0
+            self.progress_bar.hide()
+            self.top_toolbar.set_progress(0)
+            self._sync_task_statuses()
+
+    def _on_save_snapshot(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存快照", "snapshot.png", "PNG Image (*.png);;JPEG Image (*.jpg)"
+        )
+        if not path:
+            return
+        if self.image_view.viewer.grab().save(path):
+            self.log_panel.success(f"已保存: {path}")
+        else:
+            self.log_panel.error("保存失败")
+
+    def _on_toggle_mask_compare(self):
+        raw = getattr(self.state, 'mask_raw', None)
+        result = getattr(self.state, 'mask_result', None)
+        processed = result.get("processed_mask") if isinstance(result, dict) else None
+        if raw is None or processed is None:
+            self.log_panel.error("请先完成 AI 识别和掩膜处理")
+            return
+        self._show_mask_before = not self._show_mask_before
+        self._show_mask_overlay(raw if self._show_mask_before else processed)
+        self.log_panel.info("显示处理前掩膜" if self._show_mask_before else "显示处理后掩膜")
+
+    def _on_measure_tool_changed(self, tool):
+        self._measure_tool = tool
+        self._measure_points = []
+        if tool:
+            self._field_drawing = False
+            self._sync_drawing_mode()
+            tips = {
+                "point": "点选模式：点击地图查看经纬度",
+                "line": "测距模式：点击两个点测量距离",
+                "area": "测面积模式：点击多边形顶点并闭合",
+            }
+            self.log_panel.info(tips.get(tool, "测量工具"))
+        else:
+            self.log_panel.info("已关闭测量工具")
+
+    def _format_distance(self, meters):
+        if meters >= 1000:
+            return f"{meters / 1000:.3f} km"
+        if meters >= 1:
+            return f"{meters:.2f} m"
+        return f"{meters * 100:.1f} cm"
+
+    def _handle_measure_click(self, x, y, button):
+        viewer = self.image_view.viewer
+        tool = self._measure_tool
+        if tool == "point" and button == 1:
+            viewer.draw_circle(x, y, radius=7, color=(255, 200, 0))
+            if self.geo.is_ready():
+                lon, lat = self.geo.pixel_to_lonlat(x, y)
+                text = f"lon:{lon:.7f}\nlat:{lat:.7f}"
+            else:
+                text = f"x:{x}\ny:{y}"
+            viewer.draw_text(x + 10, y + 10, text, color=(255, 255, 255), size=11)
+            self.log_panel.info(text.replace("\n", "  "))
+            return True
+        if tool == "line" and button == 1:
+            self._measure_points.append((x, y))
+            viewer.draw_circle(x, y, radius=6, color=(0, 220, 255))
+            if len(self._measure_points) == 2:
+                p1, p2 = self._measure_points
+                dist = self.geo.pixel_distance_m(p1, p2) if self.geo.is_ready() else math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                unit = self._format_distance(dist) if self.geo.is_ready() else f"{dist:.1f} px"
+                viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(0, 220, 255), width=3)
+                viewer.draw_text((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2, unit, color=(255, 255, 255), size=12)
+                self.log_panel.info(f"??: {unit}")
+                self._measure_points = []
+            return True
+        if tool == "area":
+            if button == 2 and len(self._measure_points) >= 3:
+                self._finish_measure_area()
+                return True
+            if button != 1:
+                return True
+            if len(self._measure_points) >= 3:
+                first = self._measure_points[0]
+                if math.hypot(x - first[0], y - first[1]) <= 12:
+                    self._finish_measure_area()
+                    return True
+            self._measure_points.append((x, y))
+            viewer.draw_circle(x, y, radius=6, color=(255, 220, 0))
+            if len(self._measure_points) >= 2:
+                p1, p2 = self._measure_points[-2], self._measure_points[-1]
+                viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(255, 220, 0), width=3)
+            return True
+        return False
+
+    def _finish_measure_area(self):
+        pts = list(self._measure_points)
+        if len(pts) < 3:
+            return
+        viewer = self.image_view.viewer
+        viewer.draw_line(pts[-1][0], pts[-1][1], pts[0][0], pts[0][1], color=(255, 220, 0), width=3)
+        area_info = self._estimate_field_area(pts)
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        viewer.draw_text(cx, cy, f"面积: {area_info}", color=(255, 255, 255), size=12)
+        self.log_panel.info(f"面积测量: {area_info}")
+        self._measure_points = []
+    def _mask_for_overlay(self, mask):
+        if self._tif_rgb is None or mask is None:
+            return None
+        full_h, full_w = self._tif_rgb.shape[:2]
+        if mask.shape[:2] == (full_h, full_w):
+            return mask
+        x0 = int(getattr(self.state, 'mask_offset_x', 0) or 0)
+        y0 = int(getattr(self.state, 'mask_offset_y', 0) or 0)
+        out = np.zeros((full_h, full_w), dtype=np.uint8)
+        h, w = mask.shape[:2]
+        dst_x0 = max(0, x0)
+        dst_y0 = max(0, y0)
+        dst_x1 = min(full_w, x0 + w)
+        dst_y1 = min(full_h, y0 + h)
+        if dst_x1 <= dst_x0 or dst_y1 <= dst_y0:
+            return out
+        src_x0 = dst_x0 - x0
+        src_y0 = dst_y0 - y0
+        out[dst_y0:dst_y1, dst_x0:dst_x1] = mask[src_y0:src_y0 + (dst_y1 - dst_y0),
+                                                 src_x0:src_x0 + (dst_x1 - dst_x0)]
+        return out
+
+    def _overlay_mask_in_place(self, ov, mask):
+        """Overlay full-size or cropped masks without allocating full-size temp images."""
+        if ov is None or mask is None:
+            return ov
+        full_h, full_w = ov.shape[:2]
+        mask_h, mask_w = mask.shape[:2]
+        if (mask_h, mask_w) == (full_h, full_w):
+            dst_x0 = dst_y0 = src_x0 = src_y0 = 0
+            dst_x1, dst_y1 = full_w, full_h
+        else:
+            x0 = int(getattr(self.state, 'mask_offset_x', 0) or 0)
+            y0 = int(getattr(self.state, 'mask_offset_y', 0) or 0)
+            dst_x0 = max(0, x0)
+            dst_y0 = max(0, y0)
+            dst_x1 = min(full_w, x0 + mask_w)
+            dst_y1 = min(full_h, y0 + mask_h)
+            if dst_x1 <= dst_x0 or dst_y1 <= dst_y0:
+                return ov
+            src_x0 = dst_x0 - x0
+            src_y0 = dst_y0 - y0
+        clipped = mask[src_y0:src_y0 + (dst_y1 - dst_y0),
+                       src_x0:src_x0 + (dst_x1 - dst_x0)]
+        if clipped.size == 0:
+            return ov
+        if cv2.countNonZero(clipped.astype(np.uint8, copy=False)) == 0:
+            return ov
+        roi = ov[dst_y0:dst_y1, dst_x0:dst_x1]
+        chunk_rows = 256
+        for y in range(0, clipped.shape[0], chunk_rows):
+            m = clipped[y:y + chunk_rows]
+            nz = m > 0
+            if not np.any(nz):
+                continue
+            r = roi[y:y + chunk_rows]
+            b = r[:, :, 0]
+            g = r[:, :, 1]
+            rr = r[:, :, 2]
+            b[nz] = (b[nz].astype(np.float32) * 0.6).astype(np.uint8)
+            g[nz] = (g[nz].astype(np.float32) * 0.6 + m[nz].astype(np.float32) * 0.4).clip(0, 255).astype(np.uint8)
+            rr[nz] = (rr[nz].astype(np.float32) * 0.6).astype(np.uint8)
+        return ov
+
+    def _show_mask_overlay(self, mask):
+        if self._tif_rgb is None or mask is None:
+            return
+        viewer = self.image_view.viewer
+        if getattr(viewer, "_pixmap", None) is None:
+            self.image_view.set_image(self._tif_rgb)
+        else:
+            viewer.clear_overlays()
+        full_h, full_w = self._tif_rgb.shape[:2]
+        mask_h, mask_w = mask.shape[:2]
+        if (mask_h, mask_w) == (full_h, full_w):
+            mask_x = mask_y = 0
+        else:
+            mask_x = int(getattr(self.state, 'mask_offset_x', 0) or 0)
+            mask_y = int(getattr(self.state, 'mask_offset_y', 0) or 0)
+        mask_result = getattr(self.state, 'mask_result', None) or {}
+        headland = mask_result.get("headland_mask") if isinstance(mask_result, dict) else None
+        if isinstance(headland, np.ndarray) and headland.shape[:2] == mask.shape[:2]:
+            viewer.draw_mask_overlay(headland, mask_x, mask_y, color=(210, 230, 120))
+        viewer.draw_mask_overlay(mask, mask_x, mask_y)
+        boundary = getattr(self.state, 'field_boundary', [])
+        if boundary and len(boundary) >= 3:
+            for i in range(len(boundary)):
+                p1 = boundary[i]
+                p2 = boundary[(i + 1) % len(boundary)]
+                viewer.draw_line(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]), color=(0, 255, 100), width=2)
+        self._draw_service_points_overlay(clear_first=False)
+
+    def _show_path(self, pr):
+        if self._tif_rgb is None:
+            return
+        pr = self._normalise_path_result(pr)
+        self.image_view.set_image(self._tif_rgb)
+        viewer = self.image_view.viewer
+        mask = getattr(self.state, 'mask_raw', None)
+        mask_result = getattr(self.state, 'mask_result', None)
+        disp_mask = mask_result.get("processed_mask", mask) if mask_result else mask
+        if disp_mask is not None:
+            if disp_mask.shape[:2] == self._tif_rgb.shape[:2]:
+                mask_x = mask_y = 0
+            else:
+                mask_x = int(getattr(self.state, 'mask_offset_x', 0) or 0)
+                mask_y = int(getattr(self.state, 'mask_offset_y', 0) or 0)
+            headland = mask_result.get("headland_mask") if isinstance(mask_result, dict) else None
+            if isinstance(headland, np.ndarray) and headland.shape[:2] == disp_mask.shape[:2]:
+                viewer.draw_mask_overlay(headland, mask_x, mask_y, color=(210, 230, 120))
+            viewer.draw_mask_overlay(disp_mask, mask_x, mask_y)
+        boundary = getattr(self.state, 'field_boundary', [])
+        if boundary and len(boundary) >= 3:
+            for i in range(len(boundary)):
+                p1 = boundary[i]
+                p2 = boundary[(i + 1) % len(boundary)]
+                viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(0, 255, 100), width=4)
+        self._draw_service_points_overlay(clear_first=False)
+        for t in pr.get("tracks", []):
+            pts = self._coerce_points(t.get("points", []))
+            if len(pts) > 1:
+                viewer.draw_polyline(pts, color=(0, 255, 70), width=4)
+        for t in pr.get("turns", []):
+            pts = self._coerce_points(t.get("points", []))
+            if len(pts) > 1:
+                viewer.draw_polyline(pts, color=(70, 120, 255), width=3)
+    def _on_segment_selected(self, idx):
+        pr = self._pipeline_result or {}
+        path = self._normalise_path_result(pr.get("path", {}))
+        tracks = path.get("tracks", [])
+        turns = path.get("turns", [])
+        all_segs = []
+        for t in tracks:
+            all_segs.append({"type": "track", "points": t.get("points", [])})
+        for t in turns:
+            all_segs.append({"type": "turn", "points": t.get("points", [])})
+        if 0 <= idx < len(all_segs):
+            seg = all_segs[idx]
+            self.log_panel.info(f"选中路线段 {idx + 1}: {seg['type']}")
+            if self._tif_rgb is not None:
+                ov = self._tif_rgb.copy()
+                for t in tracks:
+                    pts = np.array(t.get("points", []))
+                    if len(pts) > 1:
+                        cv2.polylines(ov, [pts.astype(np.int32)], False, (0, 150, 40), 2)
+                for t in turns:
+                    pts = np.array(t.get("points", []))
+                    if len(pts) > 1:
+                        cv2.polylines(ov, [pts.astype(np.int32)], False, (150, 50, 50), 1)
+                if seg.get("points"):
+                    pts = np.array(seg["points"])
+                    if len(pts) > 1:
+                        hl_color = (0, 255, 80) if seg["type"] == "track" else (80, 80, 255)
+                        cv2.polylines(ov, [pts.astype(np.int32)], False, hl_color, 5)
+                self.image_view.set_image(ov)
+
+    def _on_toggle_animation(self):
+        if getattr(self.state, 'anim_active', False):
+            self.state.anim_active = False
+            self.state.anim_paused = False
+            if self._anim_timer:
+                self._anim_timer.stop()
+                self._anim_timer = None
+            self.log_panel.info("已结束演示")
+            self._show_path((self._pipeline_result or {}).get("path", {}))
+            return
+        pr = self._pipeline_result or {}
+        path = self._normalise_path_result(pr.get("path", {}))
+        auto_segs = self.state.auto_path_segments
+        if not auto_segs and not path:
+            QMessageBox.warning(self, "缺少路径", "请先生成路径后再开始模拟演示。")
+            return
+        segments = self._build_anim_segments(path, auto_segs)
+        if not segments:
+            QMessageBox.warning(self, "路径点不足", "当前路径点不足，无法进行模拟演示。\n\n请重新执行路径规划。")
+            return
+        self._anim_engine = AnimationEngine(self.state, self.geo)
+        self._anim_engine.setup(segments)
+        self.state.anim_active = True
+        self.state.anim_paused = False
+        self.state.anim_speed = 1.0
+        self.state.anim_frame = 0
+        self._anim_trail = []
+        self.log_panel.info("开始演示")
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._anim_frame_tick)
+        self._anim_timer.start(33)
+
+    def _build_anim_segments(self, path, auto_segs):
+        if auto_segs:
+            return auto_segs
+        path = self._normalise_path_result(path)
+        if path.get("full_path"):
+            return self._auto_segments_from_path(path)
+        segments = []
+        tracks = path.get("tracks", [])
+        turns = path.get("turns", [])
+        for i, t in enumerate(tracks):
+            pts = t.get("points", [])
+            if len(pts) >= 2:
+                seg = AutoPathSegment(
+                    points=[PathPoint(float(x), float(y)) for x, y in self._coerce_points(pts)],
+                    status=1, corridor_id=i,
+                    length_m=self._segment_length(pts), segment_type="work")
+                segments.append(seg)
+            if i < len(turns):
+                tpts = turns[i].get("points", [])
+                if len(tpts) >= 2:
+                    seg = AutoPathSegment(
+                        points=[PathPoint(float(x), float(y)) for x, y in self._coerce_points(tpts)],
+                        status=0, corridor_id=i,
+                        length_m=self._segment_length(tpts), segment_type="turn")
+                    segments.append(seg)
+        return segments
+
+    def _anim_frame_tick(self):
+        if not self._anim_engine or not self.state.anim_active:
+            if self._anim_timer:
+                self._anim_timer.stop()
+                self._anim_timer = None
+            return
+        finished = not self._anim_engine.advance()
+        s = self.state
+        if finished or s.anim_frame >= s.anim_total_frames - 1:
+            self.state.anim_active = False
+            if self._anim_timer:
+                self._anim_timer.stop()
+                self._anim_timer = None
+            self.log_panel.info("演示完成")
+            report = self._anim_engine._gen_report()
+            if report:
+                self.log_panel.info(report)
+            self._show_path(self._pipeline_result.get("path", {}))
+            WorkflowUpdater.advance(self.state, "ANIMATION_DONE")
+            return
+        self._render_anim_frame()
+        pct = int(s.anim_frame / max(1, s.anim_total_frames) * 100)
+        remaining = self._anim_engine.get_remaining_seconds()
+        rem_str = f"{remaining:.0f}s" if remaining > 0 else "..."
+        speed_str = f"{s.anim_speed:.0f}x"
+        self.lbl_speed.setText(f"  进度 {pct}%  速度 {speed_str}  剩余 {rem_str}  ")
+
+    def _clear_anim_overlay(self):
+        viewer = self.image_view.viewer
+        for item in getattr(self, "_anim_overlay_items", []):
+            try:
+                viewer._scene.removeItem(item)
+            except RuntimeError:
+                pass
+            if item in viewer._overlay_group:
+                viewer._overlay_group.remove(item)
+        self._anim_overlay_items = []
+
+    def _render_anim_frame(self):
+        if self._tif_rgb is None:
+            return
+        pos = self._anim_engine.get_interpolated_position()
+        if pos is None:
+            return
+        if isinstance(pos, dict):
+            px, py = pos.get("x", 0), pos.get("y", 0)
+            heading = pos.get("heading_rad", 0)
+        else:
+            point, heading = pos
+            px, py = point
+        self._anim_trail.append((int(px), int(py)))
+        if len(self._anim_trail) > 500:
+            self._anim_trail = self._anim_trail[-500:]
+
+        viewer = self.image_view.viewer
+        self._clear_anim_overlay()
+        before = len(viewer._overlay_group)
+        if len(self._anim_trail) > 1:
+            viewer.draw_polyline(self._anim_trail[-100:], color=(255, 200, 0), width=2)
+        ix, iy = int(px), int(py)
+        self._draw_harvester_pose(ix, iy, heading)
+        self._anim_overlay_items = list(viewer._overlay_group[before:])
+
+    def _draw_harvester_pose(self, x, y, heading):
+        """Draw the physical harvester model in image coordinates."""
+        viewer = self.image_view.viewer
+        params = self._effective_harvester_params(getattr(self.state, 'harvester_params', {}) or {})
+        try:
+            ppm = self.geo.pixels_per_meter(x, y) if self.geo.is_ready() else 20.0
+        except Exception:
+            ppm = 20.0
+        ppm = max(1.0, float(ppm))
+        cut_w = float(params.get('cutter_width_m', 2.0))
+        track_w = float(params.get('track_width_m', 0.35))
+        track_gauge = float(params.get('track_gauge_m', 1.7))
+        wheelbase = float(params.get('wheelbase_m', 2.5))
+        track_len = float(params.get('track_length_m', 1.5))
+        half_body_len = max(8.0, max(wheelbase, track_len) * ppm * 0.5)
+        half_body_w = max(5.0, (track_gauge + track_w) * ppm * 0.5)
+        half_cut_w = max(7.0, cut_w * ppm * 0.5)
+        half_track_w = max(2.0, track_w * ppm * 0.5)
+        half_track_len = max(6.0, track_len * ppm * 0.5)
+        track_spacing = max(4.0, track_gauge * ppm * 0.5)
+        c, s_v = math.cos(heading), math.sin(heading)
+        rot = np.asarray([[c, -s_v], [s_v, c]], dtype=np.float64)
+        center = np.asarray((float(x), float(y)), dtype=np.float64)
+
+        def transform(local_points):
+            pts = np.asarray(local_points, dtype=np.float64) @ rot.T + center
+            return [(float(px), float(py)) for px, py in pts]
+
+        def polygon(local_points, fill, outline):
+            return viewer.draw_polygon(transform(local_points), color=fill, outline=outline, width=1)
+
+        polygon([(-half_body_len, -half_body_w), (half_body_len, -half_body_w), (half_body_len, half_body_w), (-half_body_len, half_body_w)], (30, 150, 205), (190, 225, 240))
+        header_depth = max(5.0, 0.32 * wheelbase * ppm)
+        polygon([(half_body_len, -half_cut_w), (half_body_len + header_depth, -half_cut_w), (half_body_len + header_depth, half_cut_w), (half_body_len, half_cut_w)], (60, 174, 76), (200, 244, 205))
+        for side in (-1.0, 1.0):
+            offset = side * track_spacing
+            polygon([(-half_track_len, offset - half_track_w), (half_track_len, offset - half_track_w), (half_track_len, offset + half_track_w), (-half_track_len, offset + half_track_w)], (32, 36, 34), (115, 125, 120))
+        polygon([(-half_body_len * 0.65, -half_body_w * 0.55), (-half_body_len * 0.05, -half_body_w * 0.55), (-half_body_len * 0.05, half_body_w * 0.55), (-half_body_len * 0.65, half_body_w * 0.55)], (54, 122, 170), (180, 213, 228))
+        cab = np.asarray((half_body_len * 0.18, -half_body_w * 0.25)) @ rot.T + center
+        viewer.draw_circle(float(cab[0]), float(cab[1]), radius=max(3, int(min(half_body_len, half_body_w) * 0.38)), color=(150, 205, 220))
+        tip = center + np.asarray((math.cos(heading), math.sin(heading))) * max(10.0, wheelbase * ppm)
+        viewer.draw_line(float(center[0]), float(center[1]), float(tip[0]), float(tip[1]), color=(255, 255, 100), width=2)
+        viewer.draw_circle(x, y, radius=4, color=(255, 255, 0))
+
+    def _on_export_geojson(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出 GeoJSON", "path_result.geojson", "GeoJSON (*.geojson)")
+        if not path:
+            return
+        features = []
+        try:
+            path_result, geo_points = self._geo_export_payload()
+        except Exception as e:
+            self._show_geo_export_error("GeoJSON", e)
+            return
+        points_by_segment = {}
+        for point in geo_points:
+            segment_index = int(point.get("segment_index", 0))
+            points_by_segment.setdefault(segment_index, []).append(point)
+        for i, segment in enumerate(path_result.get("ordered_segments", [])):
+            segment_points = points_by_segment.get(i, [])
+            if len(segment_points) >= 2:
+                coords = [
+                    [float(point["lon"]), float(point["lat"])]
+                    for point in segment_points
+                ]
+                segment_type = str(segment.get("type", "work"))
+                features.append({
+                    "type": "Feature",
+                    "properties": {
+                        "id": i + 1,
+                        "segment_index": int(segment.get("segment_index", i)),
+                        "type": segment_type,
+                    },
+                    "geometry": {"type": "LineString", "coordinates": coords},
+                })
+        try:
+            save_json_atomic(
+                path,
+                {"type": "FeatureCollection", "features": features},
+            )
+            manifest = self._write_export_manifest(
+                path, "GeoJSON", path_result, geo_points
+            )
+            WorkflowUpdater.advance(self.state, "EXPORTED")
+            self.log_panel.success(f"已导出 GeoJSON: {path}；溯源清单: {manifest}")
+        except Exception as e:
+            self._show_geo_export_error("GeoJSON", e)
+
+    def _on_export_csv_geo(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出 CSV", "path_result.csv", "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            _path_result, geo_points = self._geo_export_payload()
+            from path_planner import export_csv
+            export_csv(geo_points, path)
+            manifest = self._write_export_manifest(path, "CSV", _path_result, geo_points)
+            WorkflowUpdater.advance(self.state, "EXPORTED")
+            self.log_panel.success(f"已导出 CSV: {path}；溯源清单: {manifest}")
+        except Exception as e:
+            self._show_geo_export_error("CSV", e)
+
+    def _on_export_kml(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出 KML", "path_result.kml", "KML (*.kml)")
+        if not path:
+            return
+        try:
+            _path_result, geo_points = self._geo_export_payload()
+            from path_planner import export_kml
+            export_kml(geo_points, path)
+            manifest = self._write_export_manifest(path, "KML", _path_result, geo_points)
+            WorkflowUpdater.advance(self.state, "EXPORTED")
+            self.log_panel.success(f"已导出 KML: {path}；溯源清单: {manifest}")
+        except Exception as e:
+            self._show_geo_export_error("KML", e)
+
+    def _on_export_json(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出 JSON", "path_result.json", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            path_result, geo_points = self._geo_export_payload()
+            from path_planner import export_json
+            export_json(geo_points, path_result.get("validation", {}), path)
+            manifest = self._write_export_manifest(path, "JSON", path_result, geo_points)
+            WorkflowUpdater.advance(self.state, "EXPORTED")
+            self.log_panel.success(f"已导出 JSON: {path}；溯源清单: {manifest}")
+        except Exception as e:
+            self._show_geo_export_error("JSON", e)
+
+    def _on_export_path_format(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出 $PATH", "mission.path", "PATH (*.path);;Text (*.txt)")
+        if not path:
+            return
+        try:
+            _path_result, geo_points = self._geo_export_payload()
+            from path_planner import export_path_format
+            export_path_format(geo_points, path)
+            manifest = self._write_export_manifest(path, "$PATH", _path_result, geo_points)
+            WorkflowUpdater.advance(self.state, "EXPORTED")
+            self.log_panel.success(f"已导出 $PATH: {path}；溯源清单: {manifest}")
+        except Exception as e:
+            self._show_geo_export_error("$PATH", e)
+
+    def _on_export_img(self):
+        path, _ = QFileDialog.getSaveFileName(self, "保存图像", "result.png", "PNG (*.png);;JPEG (*.jpg)")
+        if not path or self._tif_rgb is None:
+            return
+        overlay = self._tif_rgb.copy()
+        pr = self._pipeline_result or {}
+        path_result = self._normalise_path_result(pr.get("path", {}))
+        for track in path_result.get("tracks", []):
+            pts = np.array(track.get("points", []))
+            if len(pts) > 1:
+                cv2.polylines(overlay, [pts.astype(np.int32)], False, (0, 200, 50), 3)
+        cv2.imwrite(path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        self.log_panel.success(f"已保存图像: {path}")
+    def _on_params_dialog(self):
+        dlg = HarvesterParamsDialog(self.cfg._raw.get("harvester", {}), self)
+        if dlg.exec() == QDialog.Accepted:
+            p = dlg.get_params()
+            previous = self._effective_harvester_params(
+                getattr(self.state, "harvester_params", {}) or {}
+            )
+            self._save_system_undo("修改农机参数")
+            self.state.harvester_params = p
+            self.log_panel.success(
+                "农机参数已保存: "
+                f"割台={p['cutter_width_m']:.2f}m, "
+                f"履带={p['track_width_m']:.2f}m, "
+                f"中心距={p['track_gauge_m']:.2f}m, "
+                f"轴距={p['wheelbase_m']:.2f}m, "
+                f"转弯半径={p['turn_radius_m']:.2f}m"
+            )
+            self.cfg._raw.setdefault("harvester", {}).update(p)
+            cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+            save_json_atomic(cfg_path, self.cfg._raw)
+            if (
+                getattr(self.state, "auto_path_planned", False)
+                and any(
+                    abs(float(previous.get(key, 0.0)) - float(p.get(key, 0.0))) > 1e-9
+                    for key in p
+                )
+            ):
+                self._invalidate_analysis_from(
+                    "path",
+                    "农机物理参数已变化，旧路径足迹验证已经失效",
+                )
+            self._sync_task_statuses()
+
+    def _on_settings_dialog(self):
+        if SettingsDialog(self.cfg._raw, self).exec() == QDialog.Accepted:
+            self._mask_processing_strength = str(self.cfg._raw.get("mask_processing", {}).get("strength", "standard"))
+            self.task_panel.set_mask_strength(self._mask_processing_strength)
+
+    def _on_project_log(self):
+        entries = self._journal.recent(100)
+        ProjectLogDialog(entries, self).exec()
+
+    def _on_diagnose(self):
+        DiagnosisDialog({
+            "Python": sys.version,
+            "影像": os.path.basename(self._tif_path or "?"),
+            "模型": "已加载" if self.model_engine.is_loaded() else "未加载",
+            "田块边界": f"{len(getattr(self.state, 'field_boundary', []))} 点",
+            "路径点": f"{len(getattr(self.state, 'path_points', []))} 点",
+            "地理坐标": "可用" if self.geo.is_ready() else "不可用",
+            "转弯策略": getattr(self.state, 'turn_strategy', 'auto'),
+        }, self).exec()
+
+    @staticmethod
+    def _nearest(value, candidates):
+        return min(candidates, key=lambda item: abs(float(item) - float(value)))
+
+    def _build_machine_recommendation(self, path_result):
+        path_result = self._normalise_path_result(path_result)
+        validation = path_result.get("validation", {}) or {}
+        mask_result = getattr(self.state, "mask_result", None) or {}
+        diagnostics = mask_result.get("diagnostics", {}) if isinstance(mask_result, dict) else {}
+        hp = self._effective_harvester_params(getattr(self.state, "harvester_params", {}) or {})
+
+        bands = list(mask_result.get("all_bands", []) or []) if isinstance(mask_result, dict) else []
+        widths = [float(b.get("width_m", 0.0)) for b in bands if isinstance(b, dict) and b.get("width_m")]
+        median_width = float(np.median(widths)) if widths else 0.0
+        main_angle = float(mask_result.get("main_angle", 0.0) or 0.0) if isinstance(mask_result, dict) else 0.0
+        centroids = []
+        for band in bands:
+            if isinstance(band, dict) and band.get("centroid"):
+                try:
+                    x, y = band["centroid"]
+                    centroids.append(float(x) * math.cos(main_angle + math.pi / 2.0) + float(y) * math.sin(main_angle + math.pi / 2.0))
+                except Exception:
+                    pass
+        spacings = []
+        if len(centroids) >= 2:
+            ordered = np.sort(np.asarray(centroids, dtype=np.float64))
+            mpp = float(diagnostics.get("meters_per_pixel", 0.0) or 0.0)
+            if mpp > 0:
+                spacings = [float(v * mpp) for v in np.diff(ordered) if v > 0]
+        median_spacing = float(np.median(spacings)) if spacings else 0.0
+
+        rolling = float(validation.get("track_core_overlap_pct", validation.get("rolling_crop_pct", 0.0)) or 0.0)
+        outside = float(validation.get("track_outside_field_pct", 0.0) or 0.0)
+        coverage = float(validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct", 0.0)) or 0.0)
+        work_len = float(validation.get("work_length_m", path_result.get("work_length_m", 0.0)) or 0.0)
+        turn_len = float(validation.get("turn_length_m", path_result.get("turn_length_m", 0.0)) or 0.0)
+        turn_ratio = turn_len / max(work_len, 1.0)
+        issues = list(validation.get("issues") or [])
+        assessment = path_result.get("turn_assessment", {}) or {}
+        issues.extend(assessment.get("hard_reasons") or [])
+
+        current_track = float(hp.get("track_width_m", 0.45) or 0.45)
+        track_candidates = [0.40, 0.45, 0.50, 0.55]
+        if rolling > 8.0:
+            target_track = 0.45 if current_track >= 0.45 else current_track
+        elif outside < 1.0 and turn_ratio < 0.28 and coverage >= 90.0:
+            target_track = 0.50
+        else:
+            target_track = 0.45
+        target_track = self._nearest(target_track, track_candidates)
+
+        current_gauge = float(hp.get("track_gauge_m", 1.7) or 1.7)
+        target_gauge = current_gauge
+        if rolling > 8.0 and outside <= 2.0:
+            target_gauge += 0.10
+        elif outside > 2.0:
+            target_gauge -= 0.10
+        if median_spacing > 0:
+            target_gauge = min(target_gauge, max(1.4, median_spacing * 2.0))
+        target_gauge = max(1.4, min(2.0, round(target_gauge, 1)))
+
+        compact_turn = bool(issues) or turn_ratio > 0.35 or outside > 2.0
+        target_wheelbase = 1.8 if compact_turn else 1.9
+        target_turn_radius = 0.9 if compact_turn else 1.0
+        target_track_length = max(1.6, min(2.0, target_wheelbase - 0.1))
+
+        params = dict(hp)
+        params.update({
+            "track_width_m": float(target_track),
+            "track_gauge_m": float(target_gauge),
+            "wheelbase_m": float(target_wheelbase),
+            "track_length_m": float(target_track_length),
+            "turn_radius_m": float(target_turn_radius),
+        })
+
+        reasons = []
+        if rolling > 8.0:
+            reasons.append(f"履带与作物核心重叠 {rolling:.1f}%，优先控制履带宽度并适当调整中心距。")
+        if outside > 2.0:
+            reasons.append(f"履带越界率 {outside:.1f}%，建议更紧凑的轴距/转弯半径并避免过大中心距。")
+        if turn_ratio > 0.35:
+            reasons.append(f"转弯距离占作业距离 {turn_ratio * 100:.1f}%，田头调头空间偏紧。")
+        if median_spacing > 0:
+            reasons.append(f"估计行带横向间距约 {median_spacing:.2f} m，履带中心距建议控制在 {target_gauge:.1f} m 左右。")
+        if median_width > 0:
+            reasons.append(f"重建行带中位宽度约 {median_width:.2f} m。")
+        if not reasons:
+            reasons.append("当前路径验证指标较平衡，建议使用通用紧凑型履带收获机参数。")
+
+        message = "\n".join([
+            "启发式候选参数（未经过机型适配或地形安全验证）",
+            f"- 履带宽度：{params['track_width_m'] * 100:.0f} cm",
+            f"- 履带中心距：{params['track_gauge_m']:.1f} m",
+            f"- 轴距：{params['wheelbase_m']:.1f} m",
+            f"- 履带接地长度：{params['track_length_m']:.1f} m",
+            f"- 最小转弯半径：{params['turn_radius_m']:.1f} m",
+            "",
+            "当前参数",
+            f"- 履带宽度：{current_track * 100:.0f} cm，中心距：{current_gauge:.1f} m，轴距：{float(hp.get('wheelbase_m', 0.0)):.1f} m",
+            "",
+            "分析依据",
+            f"- 调头策略：{self._turn_strategy_label(path_result)}",
+            f"- 作业线/转弯段：{len(path_result.get('tracks', []))} / {len(path_result.get('turns', []))}",
+            f"- 覆盖率：{coverage:.1f}%，履带重叠：{rolling:.1f}%，履带越界：{outside:.1f}%",
+            *[f"- {reason}" for reason in reasons],
+            "",
+            "说明：当前系统没有 DEM、坡度、土壤承载力、重心或侧翻模型。以下结果仅根据影像行带和路径指标生成，不是地形安全结论，也不能替代具体机型技术参数。割台宽度暂沿用当前配置；应用后必须重新生成路径。",
+        ])
+        return {
+            "title": "基于路径指标的启发式农机参数候选",
+            "message": message,
+            "params": params,
+            "method": "path_metric_heuristic_v1",
+            "validated": False,
+        }
+
+    def _show_machine_recommendation(self, path_result):
+        recommendation = self._build_machine_recommendation(path_result)
+        dlg = MachineRecommendationDialog(recommendation, self)
+        if dlg.exec() == QDialog.Accepted:
+            params = self._effective_harvester_params(dlg.get_params())
+            self._save_system_undo("应用农机尺寸建议")
+            self.state.harvester_params = params
+            self.cfg._raw.setdefault("harvester", {}).update(params)
+            cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+            save_json_atomic(cfg_path, self.cfg._raw)
+            if getattr(self.state, "auto_path_planned", False):
+                self._invalidate_analysis_from(
+                    "path",
+                    "已应用新的启发式候选参数，必须重新规划和验证",
+                )
+            self._sync_task_statuses()
+            self.log_panel.success(
+                "已应用农机尺寸建议: "
+                f"履带={params['track_width_m']:.2f}m, "
+                f"中心距={params['track_gauge_m']:.2f}m, "
+                f"轴距={params['wheelbase_m']:.2f}m"
+            )
+
+    def _show_validation_report(self, path_result, validation):
+        path_result = self._normalise_path_result(path_result)
+        data = {
+            "track_count": len(path_result.get("tracks", [])),
+            "turn_count": len(path_result.get("turns", [])),
+            "total_length_m": validation.get("total_length_m", 0),
+            "area_m2": validation.get("harvest_area_m2", 0),
+            "turn_strategy": getattr(self.state, 'turn_strategy', 'auto'),
+            "cutter_width": getattr(self.state, 'harvester_params', {}).get('cutter_width_m', 2.0),
+        }
+        extra = []
+        if "harvest_coverage_pct" in validation:
+            extra.append(f"覆盖率: {validation['harvest_coverage_pct']:.1f}%")
+        if "track_core_overlap_pct" in validation:
+            extra.append(f"碾压率: {validation['track_core_overlap_pct']:.1f}%")
+        if "field_efficiency" in validation:
+            extra.append(f"效率: {validation['field_efficiency']:.1f}%")
+        if "crossing_count" in validation:
+            extra.append(f"交叉点: {validation['crossing_count']}")
+        if extra:
+            self.log_panel.info("路径指标: " + " | ".join(extra))
+
+    def _warn_path_validation_issues(self, path_result):
+        path_result = path_result or {}
+        validation = path_result.get("validation", {}) or {}
+        assessment = path_result.get("turn_assessment", {}) or {}
+        issues = list(validation.get("issues") or [])
+        issues.extend(assessment.get("hard_reasons") or [])
+        warnings = list(assessment.get("warnings") or [])
+        if issues:
+            message = "路径已生成，但存在以下风险，不代表农机参数缺失：\n\n" + "\n".join(
+                f"• {item}" for item in issues
+            )
+            message += "\n\n建议：可切换调头方式重算，或进入“编辑路线”横向微调作业线/转弯段。"
+            self.log_panel.warn("路径风险提示: " + "；".join(str(x) for x in issues[:3]))
+            QMessageBox.warning(self, "路径风险提示", message)
+        elif warnings:
+            self.log_panel.warn("调头方式提示: " + "；".join(str(x) for x in warnings[:3]))
+
+    def _on_route_edit_requested(self):
+        if self._route_edit_active:
+            self._route_edit_active = False
+            self._route_drag_idx = -1
+            self._sync_drawing_mode()
+            self._save_system_undo("退出路线编辑")
+            self._sync_auto_path_from_editable_route()
+            self._show_path((self._pipeline_result or {}).get("path", {}))
+            self.log_panel.info("已退出路线编辑")
+            return
+        if not getattr(self.state, 'auto_path', None) and len(getattr(self.state, 'path_points', [])) < 2:
+            self.log_panel.info("尚无路线：可用 Alt+左键创建路线控制点。")
+        if getattr(self.state, 'auto_path', None):
+            self._prepare_route_editing()
+        self._route_edit_active = True
+        self._route_drag_idx = -1
+        self.state.selected_type = None
+        self.state.selected_idx = -1
+        self.state.entry_exit_mode = False
+        self._field_drawing = False
+        self._sync_drawing_mode()
+        self._draw_route_edit_overlay()
+        self.log_panel.info("路线编辑：Alt+左键在线段插点，拖动控制点，Backspace 删除选中点")
+
+    def _prepare_route_editing(self):
+        """Build a compact, shape-preserving control polyline for manual route editing."""
+        st = self.state
+        if not getattr(st, 'auto_path', None):
+            return
+        points = []
+        statuses = []
+        tolerance_m = max(0.005, float(self.cfg._raw.get("ui", {}).get("route_edit_tolerance_m", 0.02)))
+
+        def simplify(source_points):
+            values = np.asarray(source_points, dtype=np.float32)
+            if len(values) <= 2:
+                return [tuple(map(float, point)) for point in values]
+            tolerance_px = 2.0
+            if self.geo.is_ready():
+                try:
+                    one_pixel_m = self.geo.pixel_distance_m(tuple(values[0]), (float(values[0, 0] + 1.0), float(values[0, 1])))
+                    tolerance_px = max(1.0, tolerance_m / max(one_pixel_m, 1e-9))
+                except Exception:
+                    tolerance_px = 2.0
+            simplified = cv2.approxPolyDP(values.reshape(-1, 1, 2), tolerance_px, False).reshape(-1, 2)
+            simplified[0] = values[0]
+            simplified[-1] = values[-1]
+            return [tuple(map(float, point)) for point in simplified]
+
+        for segment in st.auto_path:
+            segment_status = int(getattr(segment, 'status', self._status_for_segment_type(getattr(segment, 'segment_type', 'work'))))
+            source_points = self._coerce_points(getattr(segment, 'points', []))
+            for point in simplify(source_points):
+                if not points:
+                    points.append(point)
+                    continue
+                if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) <= 1e-6:
+                    continue
+                points.append(point)
+                statuses.append(segment_status)
+        if len(points) >= 2:
+            st.path_points = points
+            st.path_status = statuses[:len(points) - 1]
+            st.selected_type = None
+            st.selected_idx = -1
+
+    def _sync_auto_path_from_editable_route(self):
+        """Rebuild automatic path segments after a LabelMe-style manual route edit."""
+        st = self.state
+        points = [tuple(map(float, point)) for point in getattr(st, 'path_points', [])]
+        if len(points) < 2:
+            st.auto_path = []
+            st.auto_path_segments = []
+            st.auto_path_geo = []
+            st.auto_path_planned = False
+            return
+        expected = len(points) - 1
+        statuses = [int(value) for value in getattr(st, 'path_status', [])[:expected]]
+        if len(statuses) < expected:
+            statuses.extend([1] * (expected - len(statuses)))
+        st.path_status = statuses
+        status_to_type = {0: "turn", 1: "work", 2: "entry", 3: "exit", 4: "turn_reverse"}
+        segments = []
+        current_status = statuses[0]
+        current_points = [points[0], points[1]]
+        for edge_index in range(1, expected):
+            edge_status = statuses[edge_index]
+            if edge_status == current_status:
+                current_points.append(points[edge_index + 1])
+                continue
+            segments.append(self._route_segment_from_points(current_points, current_status, status_to_type))
+            current_status = edge_status
+            current_points = [points[edge_index], points[edge_index + 1]]
+        segments.append(self._route_segment_from_points(current_points, current_status, status_to_type))
+        st.auto_path = segments
+        st.auto_path_segments = segments
+        full_path = [
+            [(point.pixel_x, point.pixel_y) for point in segment.points]
+            for segment in segments
+        ]
+        segment_types = [segment.segment_type for segment in segments]
+        geo_points = []
+        if self.geo.is_ready():
+            from path_planner import global_path_to_geo
+            geo_points = global_path_to_geo(full_path, self.geo, segment_types)
+        st.auto_path_geo = geo_points
+        st.auto_path_planned = True
+        st.auto_path_valid = False
+        st.auto_path_desc = "路线已手动编辑，覆盖率与碾压率需重新规划后评估"
+        st.last_work_path_m = sum(item.length_m for item in segments if item.segment_type == "work")
+        st.last_turn_path_m = sum(item.length_m for item in segments if item.segment_type.startswith("turn"))
+        st.last_entry_exit_path_m = sum(item.length_m for item in segments if item.segment_type in ("entry", "exit"))
+        st.last_total_path_m = st.last_work_path_m + st.last_turn_path_m + st.last_entry_exit_path_m
+        st.simulation_done = False
+        st.export_done = False
+        path_result = {
+            "full_path": full_path,
+            "segment_types": segment_types,
+            "segment_lengths_m": [float(segment.length_m) for segment in segments],
+            "geo_points": geo_points,
+            "validation": {
+                "valid": False,
+                "issues": ["路线已手动编辑，覆盖率与碾压率需重新规划后评估"],
+                "total_length_m": float(st.last_total_path_m),
+                "work_length_m": float(st.last_work_path_m),
+                "turn_length_m": float(st.last_turn_path_m),
+            },
+            "is_valid": False,
+            "description": st.auto_path_desc,
+        }
+        result = dict(self._pipeline_result or {})
+        result["path"] = self._normalise_path_result(path_result)
+        self._pipeline_result = result
+        self.route_info.update_from_auto_path(st.auto_path)
+
+    def _route_segment_from_points(self, points, status, status_to_type):
+        segment = AutoPathSegment(status=int(status), segment_type=status_to_type.get(int(status), "work"))
+        segment.points = [PathPoint(float(x), float(y)) for x, y in points]
+        segment.length_m = sum(self.geo.pixel_distance_m(points[index - 1], points[index]) if self.geo.is_ready() else math.hypot(points[index][0] - points[index - 1][0], points[index][1] - points[index - 1][1]) for index in range(1, len(points)))
+        return segment
+
+    def _route_edit_nearest_node(self, point, threshold=12.0):
+        best_idx = -1
+        best_dist = float("inf")
+        for idx, route_point in enumerate(getattr(self.state, 'path_points', []) or []):
+            dist = math.hypot(float(route_point[0]) - float(point[0]), float(route_point[1]) - float(point[1]))
+            if dist < best_dist:
+                best_idx = idx
+                best_dist = dist
+        return best_idx if best_dist <= threshold else -1
+
+    def _route_edit_insert_point(self, point, save_undo=True):
+        points = list(getattr(self.state, 'path_points', []) or [])
+        if save_undo:
+            self.state.save_route_undo("路线插点")
+        point = (float(point[0]), float(point[1]))
+        if len(points) < 2:
+            points.append(point)
+            self.state.path_points = points
+            if len(points) >= 2 and not self.state.path_status:
+                self.state.path_status = [1]
+            return len(points) - 1
+        best_index = 0
+        best_distance = float("inf")
+        best_point = point
+        for index in range(len(points) - 1):
+            projected = self._project_point_to_segment(point, points[index], points[index + 1])
+            distance = math.hypot(point[0] - projected[0], point[1] - projected[1])
+            if distance < best_distance:
+                best_index = index
+                best_distance = distance
+                best_point = projected
+        insert_at = best_index + 1
+        points.insert(insert_at, best_point)
+        statuses = list(getattr(self.state, 'path_status', []) or [])
+        edge_status = statuses[best_index] if best_index < len(statuses) else 1
+        statuses.insert(insert_at, edge_status)
+        self.state.path_points = points
+        self.state.path_status = statuses[:len(points) - 1]
+        return insert_at
+
+    def _route_edit_delete_point(self, index, save_undo=True):
+        points = list(getattr(self.state, 'path_points', []) or [])
+        if not (0 <= index < len(points)) or len(points) <= 2:
+            return False
+        if save_undo:
+            self.state.save_route_undo("删除路线点")
+        points.pop(index)
+        statuses = list(getattr(self.state, 'path_status', []) or [])
+        if index < len(statuses):
+            statuses.pop(index)
+        elif statuses:
+            statuses.pop()
+        self.state.path_points = points
+        self.state.path_status = statuses[:len(points) - 1]
+        self.state.selected_type = None
+        self.state.selected_idx = -1
+        return True
+
+    def _route_edit_move_point(self, index, point, save_undo=True):
+        points = list(getattr(self.state, 'path_points', []) or [])
+        if not (0 <= index < len(points)):
+            return False
+        if save_undo:
+            self.state.save_route_undo("移动路线点")
+        points[index] = (float(point[0]), float(point[1]))
+        self.state.path_points = points
+        self.state.selected_type = 'node'
+        self.state.selected_idx = index
+        return True
+
+    @staticmethod
+    def _project_point_to_segment(point, start, end):
+        px, py = float(point[0]), float(point[1])
+        ax, ay = float(start[0]), float(start[1])
+        bx, by = float(end[0]), float(end[1])
+        dx, dy = bx - ax, by - ay
+        denom = dx * dx + dy * dy
+        if denom <= 1e-12:
+            return ax, ay
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / denom))
+        return ax + t * dx, ay + t * dy
+
+    def _handle_route_edit_press(self, x, y, button):
+        if button != 1:
+            return False
+        point = (float(x), float(y))
+        modifiers = QGuiApplication.keyboardModifiers()
+        if modifiers & Qt.AltModifier:
+            index = self._route_edit_insert_point(point)
+            self.state.selected_type = 'node'
+            self.state.selected_idx = index
+            self._sync_auto_path_from_editable_route()
+            self._draw_route_edit_overlay()
+            return True
+        idx = self._route_edit_nearest_node(point)
+        if idx >= 0:
+            self.state.save_route_undo("移动路线点")
+            self._route_drag_idx = idx
+            self.state.selected_type = 'node'
+            self.state.selected_idx = idx
+            return True
+        return False
+
+    def _draw_route_edit_overlay(self):
+        viewer = self.image_view.viewer
+        viewer.clear_overlays()
+        if self._tif_rgb is not None and getattr(viewer, "_pixmap", None) is None:
+            self.image_view.set_image(self._tif_rgb)
+        points = list(getattr(self.state, 'path_points', []) or [])
+        statuses = list(getattr(self.state, 'path_status', []) or [])
+        for index in range(len(points) - 1):
+            status = statuses[index] if index < len(statuses) else 1
+            color = (0, 255, 70) if status == 1 else (70, 120, 255)
+            viewer.draw_line(points[index][0], points[index][1], points[index + 1][0], points[index + 1][1], color=color, width=4)
+        for index, point in enumerate(points):
+            selected = getattr(self.state, 'selected_type', None) == 'node' and getattr(self.state, 'selected_idx', -1) == index
+            viewer.draw_circle(point[0], point[1], radius=8 if selected else 6, color=(255, 255, 255) if selected else (255, 120, 0))
+            if len(points) <= 30:
+                viewer.draw_text(point[0] + 8, point[1] - 8, str(index + 1), color=(245, 245, 245), size=10)
+        self._draw_service_points_overlay(clear_first=False)
+
+    def _sync_drawing_mode(self):
+        active = self._field_drawing or getattr(self.state, 'entry_exit_mode', False) or self._route_edit_active
+        self.image_view.viewer.drawing_mode = active
+        self.image_view.viewer.setCursor(Qt.CrossCursor if active else Qt.ArrowCursor)
+        if self._field_drawing:
+            self.lbl_status.setText("请先完成影像导入和田块圈选")
+        elif getattr(self.state, 'entry_exit_mode', False):
+            self.lbl_status.setText("请先完成掩膜处理")
+        elif self._route_edit_active:
+            self.lbl_status.setText("路线编辑：拖动点，Alt+左键插点，Backspace 删除选中点")
+        else:
+            self.lbl_status.setText("就绪")
+    def _refresh_state(self):
+        self.top_toolbar.refresh_actions(self.state)
+        if (self._pending_segment_display
+                and getattr(self.state, 'inference_done', False)
+                and not getattr(self.state, 'inference_running', True)):
+            self._pending_segment_display = False
+            raw_mask = getattr(self.state, 'mask_raw', None)
+            if raw_mask is not None:
+                self._show_mask_overlay(raw_mask)
+                WorkflowUpdater.advance(self.state, "INFERENCE_DONE")
+            self._sync_task_statuses()
+            self.top_toolbar.refresh_actions(self.state)
+            self.progress_bar.hide()
+            self.top_toolbar.set_progress(0)
+            self.lbl_status.setText("AI 识别完成，请继续掩膜处理")
+            self.log_panel.success("AI 识别完成，请继续掩膜处理")
+        elif (self._pending_segment_display
+              and not getattr(self.state, 'inference_running', True)):
+            self._pending_segment_display = False
+            msg = getattr(self.state, 'status_message', '') or "AI 识别中"
+            self._sync_task_statuses()
+            self.progress_bar.hide()
+            self.top_toolbar.set_progress(0)
+            self.lbl_status.setText(msg)
+            self.log_panel.error(msg)
+
+        if getattr(self.state, 'inference_running', False):
+            pct = getattr(self.state, 'inference_progress', 0.0)
+            pct_int = int(pct * 100)
+            self.progress_bar.setValue(pct_int)
+            self.task_panel.set_task_status("segment", "in_progress", pct_int)
+            self.lbl_status.setText(getattr(self.state, 'status_message', 'AI 识别中...'))
+
+    def _process_pending(self):
+        if self.event_bridge.check_pending():
+            self.event_bridge.handle_pending_action()
+
+    def keyPressEvent(self, event):
+        if self._route_edit_active and event.key() in (Qt.Key_Backspace, Qt.Key_Delete):
+            idx = getattr(self.state, 'selected_idx', -1)
+            if getattr(self.state, 'selected_type', None) == 'node' and self._route_edit_delete_point(idx):
+                self._sync_auto_path_from_editable_route()
+                self._draw_route_edit_overlay()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        if self._anim_timer:
+            self._anim_timer.stop()
+        if self._worker_thread and self._worker_thread.isRunning():
+            event.ignore()
+            first_close_request = not getattr(self, '_close_after_worker_cancel', False)
+            self._close_after_worker_cancel = True
+            if first_close_request:
+                self._close_cancel_started_at = time.time()
+                self._close_cancel_warning_shown = False
+                QTimer.singleShot(10000, self._warn_close_cancel_still_running)
+            if not getattr(self, '_task_cancel_requested', False):
+                self._cancel_background_worker()
+            elif (
+                not getattr(self, '_close_cancel_warning_shown', False)
+                and time.time() - getattr(self, '_close_cancel_started_at', time.time()) >= 10.0
+            ):
+                self._warn_close_cancel_still_running()
+            if not getattr(self, '_close_cancel_warning_shown', False):
+                self.lbl_status.setText("正在取消后台任务，完成后自动关闭...")
+            return
+        if not self._wait_processed_mask_saves(timeout_s=8.0):
+            self._log.info("processed mask cache save still running during shutdown")
+        if self._tif_path:
+            try:
+                from cache import save_project_state, wait_for_project_state_saves
+                self.state.safe_update(
+                    inference_done=bool(getattr(self.state, 'inference_done', False)),
+                    mask_processed=bool(getattr(self.state, 'mask_processed', False)),
+                    auto_path_planned=bool(getattr(self.state, 'auto_path_planned', False)),
+                )
+                save_project_state(self._tif_path, self.state)
+                wait_for_project_state_saves()
+            except Exception:
+                pass
+        self._state_timer.stop()
+        self._pending_timer.stop()
+        self._log.info("program exit")
+        super().closeEvent(event)
+
+
+
+
+
+
+
+
