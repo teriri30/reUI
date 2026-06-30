@@ -94,6 +94,37 @@ def test_field_overlay_uses_viewer_instance():
     window._draw_field_boundary()
 
 
+def test_confirmed_forbidden_polygon_is_stored_and_invalidates_old_path():
+    window = _window()
+    window.state.field_boundary = [(0, 0), (19, 0), (19, 19), (0, 19)]
+    window.state.auto_path_planned = True
+    window.state.auto_path_valid = True
+    window._forbidden_pts = [(5, 5), (10, 5), (10, 10), (5, 10)]
+
+    window._finish_forbidden_polygon()
+
+    assert window.state.forbidden_regions == [[(5, 5), (10, 5), (10, 10), (5, 10)]]
+    assert window.state.forbidden_regions_confirmed is True
+    assert window.state.auto_path_planned is False
+
+
+def test_replacing_field_boundary_invalidates_old_inference_and_forbidden_regions():
+    window = _window()
+    window.state.inference_done = True
+    window.state.mask_raw = np.ones((10, 10), dtype=np.uint8)
+    window.state.forbidden_regions = [[(2, 2), (4, 2), (4, 4), (2, 4)]]
+    window.state.forbidden_regions_confirmed = True
+    window._field_pts = [(1, 1), (18, 1), (18, 18), (1, 18)]
+
+    window._finish_field_polygon()
+
+    assert window.state.field_boundary == [(1, 1), (18, 1), (18, 18), (1, 18)]
+    assert window.state.inference_done is False
+    assert window.state.mask_raw is None
+    assert window.state.forbidden_regions == []
+    assert window.state.forbidden_regions_confirmed is False
+
+
 def test_auto_start_does_not_load_bundled_tif_without_user_choice(monkeypatch):
     window = _window()
     loaded = []
@@ -833,6 +864,46 @@ def test_validate_footprints_keeps_field_support_uncertain_and_forbidden_separat
     assert metrics["track_uncertain_overlap_pct"] > 0
     assert metrics["track_forbidden_overlap_pct"] > 0
     assert metrics["forbidden_mask_present"] is True
+
+
+def test_field_trial_profile_turns_support_metric_into_a_hard_constraint():
+    from path_planner import validate_path
+
+    class Geo:
+        def is_ready(self):
+            return True
+
+        def meters_per_pixel(self, _x, _y):
+            return 0.1
+
+    class State:
+        field_boundary = [(0, 0), (119, 0), (119, 79), (0, 79)]
+        mask_offset_x = 0
+        mask_offset_y = 0
+        harvester_params = {
+            "cutter_width_m": 0.2, "track_width_m": 0.2,
+            "track_gauge_m": 0.4, "wheelbase_m": 1.0,
+            "track_length_m": 1.0, "turn_radius_m": 1.0,
+        }
+
+    body = np.zeros((80, 120), dtype=np.uint8)
+    support = np.zeros_like(body)
+    support[:, :30] = 255
+    path = [[(60.0, 10.0), (60.0, 70.0)]]
+    result = validate_path(
+        path, body, 0.0, geo=Geo(), state=State(), segment_types=["turn"],
+        config={
+            "validation_profile": "field_trial",
+            "planning_support_mask": support,
+            "max_track_core_overlap_pct": 100.0,
+            "min_harvest_coverage_pct": 0.0,
+            "max_track_outside_field_pct": 100.0,
+        },
+    )
+
+    assert result["validation_profile"] == "field_trial"
+    assert result["validation_limits_pct"]["track_outside_support"] == 5.0
+    assert any("离开语义支撑区" in issue for issue in result["issues"])
 
 
 def test_mask_overlay_draws_headland_and_uncertain_as_separate_layers(monkeypatch):

@@ -70,6 +70,7 @@ def _window_with_path():
     path_config.update({
         "min_turn_radius_m": float(harvester["turn_radius_m"]),
         "turn_strategy": str(window.state.turn_strategy),
+        "forbidden_mask_confirmed": False,
     })
     path_inputs = {
         "mask_fingerprint": mask_record["fingerprint"],
@@ -79,6 +80,8 @@ def _window_with_path():
         "entry_point": window.state.entry_point,
         "exit_point": window.state.exit_point,
         "unload_points": list(window.state.unload_points),
+        "forbidden_regions": [],
+        "forbidden_regions_confirmed": False,
     }
     path_record = make_stage_record(
         "path",
@@ -279,6 +282,15 @@ def test_export_payload_recomputes_stale_coordinates_from_display_path():
         (10.25, 20.75),
         (15.5, 25.125),
     ]
+
+
+def test_export_rejects_forbidden_region_change_after_planning():
+    window = _window_with_path()
+    window.state.forbidden_regions = [[(1, 1), (3, 1), (3, 3), (1, 3)]]
+    window.state.forbidden_regions_confirmed = True
+
+    with pytest.raises(ValueError, match="input fingerprint"):
+        window._geo_export_payload()
 
 
 def test_export_rejects_service_point_change_after_path_planning():

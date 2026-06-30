@@ -16,7 +16,7 @@ from footprint_planner import generate_work_lines, validate_footprints
 from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
 
 
-PATH_PLANNING_VERSION = "footprint-path-v3"
+PATH_PLANNING_VERSION = "footprint-path-v4"
 
 
 def build_band_mask(shape, bands: List[Dict]) -> np.ndarray:
@@ -1720,12 +1720,39 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
     crossing_count = _count_path_intersections_proper(full_path)
     issues = []
 
+    profile = str(cfg.get("validation_profile", "research"))
+    profile_limits = {
+        "field_trial": {
+            "outside_field": 1.0,
+            "outside_support": 5.0,
+            "uncertain": 10.0,
+            "forbidden": 0.0,
+        },
+        "machine_candidate": {
+            "outside_field": 0.5,
+            "outside_support": 2.0,
+            "uncertain": 5.0,
+            "forbidden": 0.0,
+        },
+    }.get(profile)
     max_core_overlap = float(cfg.get("max_track_core_overlap_pct", 8.0))
     min_harvest_coverage = float(cfg.get("min_harvest_coverage_pct", 90.0))
-    max_outside = float(cfg.get("max_track_outside_field_pct", 2.0))
-    max_outside_support = float(cfg.get("max_track_outside_support_pct", 100.0))
-    max_uncertain = float(cfg.get("max_track_uncertain_overlap_pct", 100.0))
-    max_forbidden = float(cfg.get("max_track_forbidden_overlap_pct", 0.0))
+    max_outside = float(
+        profile_limits["outside_field"] if profile_limits
+        else cfg.get("max_track_outside_field_pct", 2.0)
+    )
+    max_outside_support = float(
+        profile_limits["outside_support"] if profile_limits
+        else cfg.get("max_track_outside_support_pct", 100.0)
+    )
+    max_uncertain = float(
+        profile_limits["uncertain"] if profile_limits
+        else cfg.get("max_track_uncertain_overlap_pct", 100.0)
+    )
+    max_forbidden = float(
+        profile_limits["forbidden"] if profile_limits
+        else cfg.get("max_track_forbidden_overlap_pct", 0.0)
+    )
     if footprint["track_core_overlap_pct"] > max_core_overlap:
         issues.append(
             f"履带与稻株核心重叠 {footprint['track_core_overlap_pct']:.1f}% "
@@ -1768,6 +1795,13 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         "entry_exit_length_m": float(entry_exit_length_m),
         "crossing_count": int(crossing_count),
         "issues": issues,
+        "validation_profile": profile,
+        "validation_limits_pct": {
+            "track_outside_field": max_outside,
+            "track_outside_support": max_outside_support,
+            "track_uncertain_overlap": max_uncertain,
+            "track_forbidden_overlap": max_forbidden,
+        },
         "field_efficiency_pct": (
             work_length_m / total_length_m * 100.0 if total_length_m > 0 else 0.0
         ),
@@ -2134,7 +2168,7 @@ def export_json(geo_points: List[Dict], validation: Dict,
 
 
 def export_path_format(geo_points: List[Dict], output_path: str):
-    """Export the route in the machine $PATH text format."""
+    """Export research-compatibility $PATH text; not a validated machine protocol."""
     geo_points = validate_geo_points(geo_points)
     cfg = Config()
     with _atomic_text_writer(output_path, encoding="utf-8") as f:

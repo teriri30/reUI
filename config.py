@@ -57,6 +57,12 @@ def validate_config(raw: dict) -> dict:
         raise ConfigValidationError(
             "work_line_mode must be band_centerline or footprint_optimized"
         )
+    if "validation_profile" in planning and str(planning["validation_profile"]) not in {
+        "research", "field_trial", "machine_candidate",
+    }:
+        raise ConfigValidationError(
+            "validation_profile must be research, field_trial, or machine_candidate"
+        )
     _validated_number(planning, "min_turn_radius_m", minimum=0.0, strict_min=True)
     _validated_number(planning, "planning_max_dim", minimum=256)
     _validated_number(planning, "validation_max_dim", minimum=256)

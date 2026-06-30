@@ -12,6 +12,25 @@ from row_geometry import meters_per_pixel, odd_size, rotate_bound, smooth_1d
 Point = Tuple[float, float]
 
 
+def rasterize_forbidden_regions(shape, state=None) -> Optional[np.ndarray]:
+    """Rasterize confirmed display-coordinate polygons into local mask space."""
+    regions = list(getattr(state, "forbidden_regions", []) or []) if state is not None else []
+    if not regions:
+        return None
+    height, width = int(shape[0]), int(shape[1])
+    result = np.zeros((height, width), dtype=np.uint8)
+    offset_x = float(getattr(state, "mask_offset_x", 0) or 0)
+    offset_y = float(getattr(state, "mask_offset_y", 0) or 0)
+    for region in regions:
+        if len(region) < 3:
+            continue
+        points = np.asarray(region, dtype=np.float64)
+        points[:, 0] -= offset_x
+        points[:, 1] -= offset_y
+        cv2.fillPoly(result, [np.round(points).astype(np.int32)], 255)
+    return result if np.count_nonzero(result) else None
+
+
 def _field_support(mask: np.ndarray, state=None) -> np.ndarray:
     support = np.zeros(mask.shape[:2], dtype=np.uint8)
     boundary = getattr(state, "field_boundary", None) if state is not None else None

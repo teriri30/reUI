@@ -246,6 +246,10 @@ def _build_project_state_payload(tif_path: str, state, stage: str = "") -> Dict[
         "tif_path": os.path.abspath(tif_path),
         "field_boundary": _jsonable(getattr(state, "field_boundary", [])),
         "field_area_m2": float(getattr(state, "field_area_m2", 0.0) or 0.0),
+        "forbidden_regions": _jsonable(getattr(state, "forbidden_regions", [])),
+        "forbidden_regions_confirmed": bool(
+            getattr(state, "forbidden_regions_confirmed", False)
+        ),
         "current_model_name": str(getattr(state, "current_model_name", "") or ""),
         "current_model_path": str(getattr(state, "current_model_path", "") or ""),
         "model_sha256": str(getattr(state, "model_sha256", "") or ""),

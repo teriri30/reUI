@@ -633,6 +633,15 @@ class PlanWorker(QObject):
             config.setdefault("headland_mask", self.mask_result.get("headland_mask"))
             config.setdefault("planning_support_mask", self.mask_result.get("planning_support_mask"))
             config.setdefault("uncertain_mask", self.mask_result.get("uncertain_residual_mask"))
+            from footprint_planner import rasterize_forbidden_regions
+            config.setdefault(
+                "forbidden_mask",
+                rasterize_forbidden_regions(processed_mask.shape, self.state),
+            )
+            config.setdefault(
+                "forbidden_mask_confirmed",
+                bool(getattr(self.state, "forbidden_regions_confirmed", False)),
+            )
             config["_cancel_callback"] = lambda: self._cancelled
             path_result = plan_path(
                 wide_bands, processed_mask, main_angle,
@@ -667,6 +676,10 @@ class PlanWorker(QObject):
                 "entry_point": getattr(self.state, "entry_point", None),
                 "exit_point": getattr(self.state, "exit_point", None),
                 "unload_points": list(getattr(self.state, "unload_points", []) or []),
+                "forbidden_regions": list(getattr(self.state, "forbidden_regions", []) or []),
+                "forbidden_regions_confirmed": bool(
+                    getattr(self.state, "forbidden_regions_confirmed", False)
+                ),
             }
             path_artifact = {
                 "full_path": path_result.get("full_path", []),

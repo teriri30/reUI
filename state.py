@@ -149,6 +149,8 @@ class AppState:
         self.field_drag_idx: int = -1
         self.field_edit_existing: bool = False
         self.field_original_boundary: List[Tuple[float, float]] = []
+        self.forbidden_regions: List[List[Tuple[float, float]]] = []
+        self.forbidden_regions_confirmed: bool = False
 
         self.harvester_params: Dict[str, float] = {}
 
@@ -268,6 +270,7 @@ class AppState:
         """Capture one logical workflow transaction for global undo/redo."""
         fields = (
             "field_boundary", "field_area_m2", "field_original_boundary",
+            "forbidden_regions", "forbidden_regions_confirmed",
             "current_model_name", "current_model_path",
             "mask_raw", "inference_original_mask", "mask_offset_x", "mask_offset_y",
             "inference_done", "mask_processed", "mask_result",
@@ -453,6 +456,8 @@ class AppState:
         tracked_keys = {
             "field_boundary",
             "field_area_m2",
+            "forbidden_regions",
+            "forbidden_regions_confirmed",
             "mask_raw",
             "mask_processed",
             "mask_result",

@@ -64,6 +64,8 @@ class MainWindow(QMainWindow):
         # 田块边界绘制状态
         self._field_drawing = False
         self._field_pts: List[Tuple[int, int]] = []
+        self._forbidden_drawing = False
+        self._forbidden_pts: List[Tuple[int, int]] = []
         self._measure_tool = ""
         self._measure_points: List[Tuple[int, int]] = []
         self._route_edit_active = False
@@ -164,7 +166,7 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "导出 CSV (经纬度)...", "Ctrl+Shift+E", self._on_export_csv_geo)
         self._add_action(fm, "导出 KML...", None, self._on_export_kml)
         self._add_action(fm, "导出 JSON...", None, self._on_export_json)
-        self._add_action(fm, "导出 $PATH 格式...", None, self._on_export_path_format)
+        self._add_action(fm, "导出 $PATH（科研兼容）...", None, self._on_export_path_format)
         self._add_action(fm, "导出快照 PNG...", None, self._on_export_img)
         fm.addSeparator()
         self._add_action(fm, "退出", QKeySequence.Quit, self.close)
@@ -185,6 +187,8 @@ class MainWindow(QMainWindow):
 
         tm = mb.addMenu("工具")
         self._add_action(tm, "田块圈选", "Ctrl+B", self._on_toggle_field_drawing)
+        self._add_action(tm, "绘制禁行区", "Ctrl+Shift+B", self._on_toggle_forbidden_drawing)
+        self._add_action(tm, "清除全部禁行区", None, self._on_clear_forbidden_regions)
         self._add_action(tm, "布设起终点与卸粮点", None, self._on_toggle_entry_exit)
         tm.addSeparator()
         self._add_action(tm, "运行", "Ctrl+R", self._on_run)
@@ -733,6 +737,7 @@ class MainWindow(QMainWindow):
                 k: v for k, v in saved.items()
                 if k in (
                     'field_boundary', 'field_area_m2', 'entry_point', 'exit_point',
+                    'forbidden_regions', 'forbidden_regions_confirmed',
                     'unload_points', 'unload_point', 'entry_point_locked',
                     'exit_point_locked', 'unload_point_locked', 'workflow_step',
                     'inference_done', 'mask_processed', 'auto_path_planned',
@@ -1129,6 +1134,8 @@ class MainWindow(QMainWindow):
             self.state.display_scale_x = 1.0
             self.state.display_scale_y = 1.0
             self.state.field_boundary = []
+            self.state.forbidden_regions = []
+            self.state.forbidden_regions_confirmed = False
             self.state.mask_raw = None
             self.state.inference_original_mask = None
             self.state.mask_result = None
@@ -1140,6 +1147,8 @@ class MainWindow(QMainWindow):
             self.image_view.clear_image()
         elif "draw_field" in affected:
             self.state.field_boundary = []
+            self.state.forbidden_regions = []
+            self.state.forbidden_regions_confirmed = False
             self._field_pts.clear()
             self._field_drawing = False
             self._sync_drawing_mode()
@@ -1345,6 +1354,9 @@ class MainWindow(QMainWindow):
             self._on_turn_strategy_changed(keys[idx])
 
     def _on_toggle_field_drawing(self):
+        if not self._field_drawing:
+            self._forbidden_drawing = False
+            self._forbidden_pts = []
         self._field_drawing = not self._field_drawing
         self._sync_drawing_mode()
         if self._field_drawing:
@@ -1374,6 +1386,22 @@ class MainWindow(QMainWindow):
                 self._clear_field_overlay()
                 self.log_panel.info("已取消田块圈选")
             return
+        if self._forbidden_drawing:
+            if button == 1:
+                if len(self._forbidden_pts) >= 3:
+                    first = self._forbidden_pts[0]
+                    if math.hypot(x - first[0], y - first[1]) <= 14:
+                        self._finish_forbidden_polygon()
+                        return
+                self._forbidden_pts.append((x, y))
+                self._redraw_forbidden_overlay(mouse_pos=(x, y))
+            elif button == 2:
+                self._forbidden_pts = []
+                self._forbidden_drawing = False
+                self._sync_drawing_mode()
+                self._restore_visual_from_state()
+                self.log_panel.info("已取消本次禁行区绘制")
+            return
         if getattr(self.state, 'entry_exit_mode', False):
             if button == 1:
                 self._place_entry_exit_point(x, y)
@@ -1396,6 +1424,8 @@ class MainWindow(QMainWindow):
             return
         if self._field_drawing and self._field_pts:
             self._redraw_field_overlay(mouse_pos=(x, y))
+        elif self._forbidden_drawing and self._forbidden_pts:
+            self._redraw_forbidden_overlay(mouse_pos=(x, y))
         self.event_bridge.on_mouse_moved(x, y, buttons)
 
     def _field_line_width(self):
@@ -1428,8 +1458,23 @@ class MainWindow(QMainWindow):
             self.log_panel.error("至少需要 3 个点")
             return
         area_m2 = self._field_area_m2(self._field_pts)
+        had_analysis = bool(
+            getattr(self.state, "inference_done", False)
+            or getattr(self.state, "mask_processed", False)
+            or getattr(self.state, "auto_path_planned", False)
+        )
         self._save_system_undo("田块圈选")
-        self.state.safe_update(field_boundary=list(self._field_pts), field_area_m2=area_m2)
+        self.state.safe_update(
+            field_boundary=list(self._field_pts),
+            field_area_m2=area_m2,
+            forbidden_regions=[],
+            forbidden_regions_confirmed=False,
+        )
+        if had_analysis:
+            self._invalidate_analysis_from(
+                "inference",
+                "田块边界已变化，必须重新识别、处理和规划",
+            )
         self._field_drawing = False
         self._sync_drawing_mode()
         self._draw_field_boundary()
@@ -1494,6 +1539,92 @@ class MainWindow(QMainWindow):
             viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(0, 255, 100), width=lw)
         for px, py in boundary:
             viewer.draw_circle(px, py, radius=vr, color=(255, 255, 0))
+        self._draw_forbidden_regions(clear_first=False)
+
+    def _on_toggle_forbidden_drawing(self):
+        if not getattr(self.state, "field_boundary", None):
+            QMessageBox.warning(self, "缺少田块边界", "请先完成田块圈选，再绘制禁行区。")
+            return
+        self._field_drawing = False
+        self._field_pts = []
+        self._forbidden_drawing = not self._forbidden_drawing
+        self._forbidden_pts = []
+        self._sync_drawing_mode()
+        self._restore_visual_from_state()
+        if self._forbidden_drawing:
+            self.log_panel.info("禁行区绘制：点击添加顶点，点击首点闭合；右键取消")
+
+    def _redraw_forbidden_overlay(self, mouse_pos=None):
+        self._restore_visual_from_state()
+        viewer = self.image_view.viewer
+        pts = self._forbidden_pts
+        for index in range(len(pts) - 1):
+            viewer.draw_line(*pts[index], *pts[index + 1], color=(40, 40, 230), width=3)
+        if mouse_pos and pts:
+            viewer.draw_line(*pts[-1], *mouse_pos, color=(40, 40, 230), width=2, style=Qt.DashLine)
+        for index, point in enumerate(pts):
+            color = (255, 255, 0) if index == 0 else (40, 40, 230)
+            viewer.draw_circle(*point, radius=7, color=color)
+
+    def _finish_forbidden_polygon(self):
+        if len(self._forbidden_pts) < 3:
+            return
+        field = np.asarray(getattr(self.state, "field_boundary", []), dtype=np.float32)
+        if any(
+            cv2.pointPolygonTest(field, (float(x), float(y)), False) < 0
+            for x, y in self._forbidden_pts
+        ):
+            QMessageBox.warning(self, "禁行区越界", "禁行区必须完全位于已确认的田块边界内。")
+            return
+        self._save_system_undo("新增禁行区")
+        regions = list(getattr(self.state, "forbidden_regions", []) or [])
+        regions.append(list(self._forbidden_pts))
+        had_path = bool(getattr(self.state, "auto_path_planned", False))
+        self.state.safe_update(
+            forbidden_regions=regions,
+            forbidden_regions_confirmed=True,
+        )
+        self._forbidden_pts = []
+        self._forbidden_drawing = False
+        self._sync_drawing_mode()
+        if had_path:
+            self._invalidate_analysis_from("path", "禁行区已变化，必须重新规划和验证")
+        self._restore_visual_from_state()
+        self.log_panel.success(f"禁行区已确认：共 {len(regions)} 个区域")
+
+    def _on_clear_forbidden_regions(self):
+        regions = list(getattr(self.state, "forbidden_regions", []) or [])
+        if not regions:
+            self.log_panel.info("当前没有禁行区")
+            return
+        if QMessageBox.question(
+            self, "清除禁行区", "确定清除全部已确认禁行区吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self._save_system_undo("清除禁行区")
+        had_path = bool(getattr(self.state, "auto_path_planned", False))
+        self.state.safe_update(forbidden_regions=[], forbidden_regions_confirmed=False)
+        if had_path:
+            self._invalidate_analysis_from("path", "禁行区已清除，必须重新规划和验证")
+        self._restore_visual_from_state()
+
+    def _draw_forbidden_regions(self, clear_first=False):
+        viewer = self.image_view.viewer
+        if clear_first:
+            viewer.clear_overlays()
+        for index, region in enumerate(getattr(self.state, "forbidden_regions", []) or []):
+            if len(region) < 3:
+                continue
+            viewer.draw_polygon(
+                region, color=(35, 35, 220), outline=(20, 20, 255),
+                width=2, alpha=75,
+            )
+            center = np.mean(np.asarray(region, dtype=np.float64), axis=0)
+            viewer.draw_text(
+                float(center[0]), float(center[1]), f"禁行 {index + 1}",
+                color=(245, 245, 245), size=10,
+            )
 
     def _redraw_field_if_any(self):
         boundary = getattr(self.state, 'field_boundary', [])
@@ -1768,6 +1899,9 @@ class MainWindow(QMainWindow):
         path_config = {
             "min_turn_radius_m": hp.get("turn_radius_m", 1.0),
             "turn_strategy": getattr(self.state, 'turn_strategy', 'auto'),
+            "forbidden_mask_confirmed": bool(
+                getattr(self.state, "forbidden_regions_confirmed", False)
+            ),
         }
         worker = PlanWorker(
             mask_result,
@@ -1981,6 +2115,9 @@ class MainWindow(QMainWindow):
         path_config.update({
             "min_turn_radius_m": float(current_harvester["turn_radius_m"]),
             "turn_strategy": str(getattr(self.state, "turn_strategy", "auto")),
+            "forbidden_mask_confirmed": bool(
+                getattr(self.state, "forbidden_regions_confirmed", False)
+            ),
         })
         path_inputs = dict(path_record.get("inputs") or {})
         path_inputs.update({
@@ -1991,6 +2128,10 @@ class MainWindow(QMainWindow):
             "entry_point": getattr(self.state, "entry_point", None),
             "exit_point": getattr(self.state, "exit_point", None),
             "unload_points": list(getattr(self.state, "unload_points", []) or []),
+            "forbidden_regions": list(getattr(self.state, "forbidden_regions", []) or []),
+            "forbidden_regions_confirmed": bool(
+                getattr(self.state, "forbidden_regions_confirmed", False)
+            ),
         })
         path_artifact = {
             "full_path": path_result.get("full_path", []),
@@ -2231,6 +2372,7 @@ class MainWindow(QMainWindow):
                 "coordinate_crs": "EPSG:4326",
                 "route_classification": "research_manual_review",
                 "machine_executable": False,
+                "usage_restriction": "RESEARCH_MANUAL_REVIEW_ONLY",
             },
             "source_image": {
                 "path": os.path.abspath(self._tif_path) if self._tif_path else "",
@@ -2262,6 +2404,12 @@ class MainWindow(QMainWindow):
                 ),
                 "machine_readiness": self._manifest_jsonable(
                     path_result.get("machine_readiness", {}) or {}
+                ),
+                "forbidden_regions": self._manifest_jsonable(
+                    getattr(self.state, "forbidden_regions", []) or []
+                ),
+                "forbidden_regions_confirmed": bool(
+                    getattr(self.state, "forbidden_regions_confirmed", False)
                 ),
                 "planning_factors": self._manifest_jsonable(
                     path_result.get("planning_factors", {}) or {}
@@ -2910,6 +3058,7 @@ class MainWindow(QMainWindow):
                 p1 = boundary[i]
                 p2 = boundary[(i + 1) % len(boundary)]
                 viewer.draw_line(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]), color=(0, 255, 100), width=2)
+        self._draw_forbidden_regions(clear_first=False)
         self._draw_service_points_overlay(clear_first=False)
 
     def _show_path(self, pr):
@@ -2940,6 +3089,7 @@ class MainWindow(QMainWindow):
                 p1 = boundary[i]
                 p2 = boundary[(i + 1) % len(boundary)]
                 viewer.draw_line(p1[0], p1[1], p2[0], p2[1], color=(0, 255, 100), width=4)
+        self._draw_forbidden_regions(clear_first=False)
         self._draw_service_points_overlay(clear_first=False)
         for t in pr.get("tracks", []):
             pts = self._coerce_points(t.get("points", []))
@@ -3227,6 +3377,15 @@ class MainWindow(QMainWindow):
             self._show_geo_export_error("JSON", e)
 
     def _on_export_path_format(self):
+        if QMessageBox.warning(
+            self,
+            "$PATH 不是已验证的机器执行文件",
+            "当前 $PATH 仅用于科研兼容和人工复核，未经过目标终端协议、车辆运动学和实车跟踪验证。\n\n"
+            "禁止直接用于无人值守农机执行。是否继续导出？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
         path, _ = QFileDialog.getSaveFileName(self, "导出 $PATH", "mission.path", "PATH (*.path);;Text (*.txt)")
         if not path:
             return
@@ -3768,11 +3927,18 @@ class MainWindow(QMainWindow):
         self._draw_service_points_overlay(clear_first=False)
 
     def _sync_drawing_mode(self):
-        active = self._field_drawing or getattr(self.state, 'entry_exit_mode', False) or self._route_edit_active
+        active = (
+            self._field_drawing
+            or self._forbidden_drawing
+            or getattr(self.state, 'entry_exit_mode', False)
+            or self._route_edit_active
+        )
         self.image_view.viewer.drawing_mode = active
         self.image_view.viewer.setCursor(Qt.CrossCursor if active else Qt.ArrowCursor)
         if self._field_drawing:
             self.lbl_status.setText("请先完成影像导入和田块圈选")
+        elif self._forbidden_drawing:
+            self.lbl_status.setText("禁行区绘制：点击首点闭合，右键取消")
         elif getattr(self.state, 'entry_exit_mode', False):
             self.lbl_status.setText("请先完成掩膜处理")
         elif self._route_edit_active:

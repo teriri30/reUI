@@ -545,7 +545,10 @@ class RouteInfoPanel(QWidget):
         self._summary.setWordWrap(True)
         self._summary.setMinimumWidth(0)
         self._summary.setStyleSheet(f"font-size:11px;color:{COLORS['text_dim']};padding:2px 14px 4px;")
-        lo.addWidget(self._title_hdr); lo.addWidget(self._summary)
+        self._safety = QLabel("路径等级：未评估")
+        self._safety.setWordWrap(True)
+        self._safety.setStyleSheet(f"font-size:11px;color:{COLORS['orange']};padding:2px 14px 6px;")
+        lo.addWidget(self._title_hdr); lo.addWidget(self._summary); lo.addWidget(self._safety)
         sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
         self._list_container = QWidget(); self._list_layout = QVBoxLayout(self._list_container); self._list_layout.setContentsMargins(8,0,8,0); self._list_layout.setSpacing(2)
         self._empty_label = QLabel("尚无路径结果。"); self._empty_label.setStyleSheet(f"font-size:12px;color:{COLORS['text_dimmer']};padding:8px;")
@@ -610,6 +613,28 @@ class RouteInfoPanel(QWidget):
             self._summary.setText(" / ".join(parts[:4]) + f" / … 共{len(parts)}项")
         else:
             self._summary.setText(" / ".join(parts))
+        readiness = data.get("machine_readiness", {}) or {}
+        mode = str((data.get("layout", {}) or {}).get("work_line_mode", "band_centerline"))
+        profile = str(validation.get("validation_profile", "research"))
+        mode_label = "足迹优化" if mode == "footprint_optimized" else "中心线"
+        profile_label = {
+            "research": "科研统计", "field_trial": "受控试验",
+            "machine_candidate": "机器候选",
+        }.get(profile, profile)
+        eligible = bool(readiness.get("eligible_for_machine_export", False))
+        self._safety.setText(
+            f"路径等级：{profile_label} | {mode_label} | "
+            f"机器执行：{'候选' if eligible else '禁止'}"
+        )
+        blockers = list(readiness.get("blockers") or [])
+        limits = validation.get("validation_limits_pct", {}) or {}
+        details = [f"阻断项: {', '.join(blockers)}" if blockers else "机器候选门禁已通过"]
+        if limits:
+            details.append(
+                "阈值(%): 田界<={track_outside_field:g}, 支撑<={track_outside_support:g}, "
+                "不确定<={track_uncertain_overlap:g}, 禁行<={track_forbidden_overlap:g}".format(**limits)
+            )
+        self._safety.setToolTip("\n".join(details))
     def update_from_auto_path(self, auto_path):
         self._clear_list(); self._empty_label.setVisible(not bool(auto_path))
         counts = {}; total = work_len = turn_len = 0.0
@@ -628,6 +653,8 @@ class RouteInfoPanel(QWidget):
         if work_len > 0: parts.append(f"作业 {work_len:.1f}m")
         if turn_len > 0: parts.append(f"转弯 {turn_len:.1f}m")
         self._summary.setText(" / ".join(parts))
+        self._safety.setText("路径等级：手动编辑/未重新验证 | 机器执行：禁止")
+        self._safety.setToolTip("手动编辑后必须重新规划并完成全部验证")
     def update_service_points(self, entry_point=None, exit_point=None, unload_points=None):
         self._clear_list(); items=[]
         if entry_point: items.append(("entry",0,"起点",True))
@@ -637,11 +664,15 @@ class RouteInfoPanel(QWidget):
         for row_idx,(kind,point_idx,label,is_work) in enumerate(items):
             row=RouteSegmentRow(row_idx,label,0.0,is_work); row.clicked.connect(lambda _r,k=kind,i=point_idx: self.service_point_selected.emit(k,i)); self._add_row(row)
         self._summary.setText(f"起终点与卸粮点 {len(items)}")
+        self._safety.setText("路径等级：尚未规划")
+        self._safety.setToolTip("")
     def clear_info(self):
         self._clear_list(); self._empty_label.setVisible(True); self._summary.setText("作业线 0 / 转弯段 0")
+        self._safety.setText("路径等级：未评估"); self._safety.setToolTip("")
     def refresh_theme(self):
         self._title_hdr.setStyleSheet(f"font-size:13px;font-weight:600;color:{COLORS['text']};padding:8px 14px 2px;")
         self._summary.setStyleSheet(f"font-size:11px;color:{COLORS['text_dim']};padding:2px 14px 4px;")
+        self._safety.setStyleSheet(f"font-size:11px;color:{COLORS['orange']};padding:2px 14px 6px;")
         self._empty_label.setStyleSheet(f"font-size:12px;color:{COLORS['text_dimmer']};padding:8px;")
         for row in self.findChildren(RouteSegmentRow):
             row.refresh_theme()

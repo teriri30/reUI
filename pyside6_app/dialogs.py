@@ -320,10 +320,28 @@ class SettingsDialog(QDialog):
 
     def _path_tab(self):
         w = QWidget(); f = QFormLayout(w)
+        path_cfg = self._config.get("path_planning", {})
+        self.combo_work_line_mode = QComboBox()
+        self.combo_work_line_mode.addItem("宽行带中心线（论文兼容）", "band_centerline")
+        self.combo_work_line_mode.addItem("农机足迹优化", "footprint_optimized")
+        current_mode = path_cfg.get("work_line_mode", "band_centerline")
+        self.combo_work_line_mode.setCurrentIndex(
+            max(0, self.combo_work_line_mode.findData(current_mode))
+        )
+        self.combo_validation_profile = QComboBox()
+        self.combo_validation_profile.addItem("科研统计", "research")
+        self.combo_validation_profile.addItem("受控田间试验", "field_trial")
+        self.combo_validation_profile.addItem("机器候选", "machine_candidate")
+        current_profile = path_cfg.get("validation_profile", "research")
+        self.combo_validation_profile.setCurrentIndex(
+            max(0, self.combo_validation_profile.findData(current_profile))
+        )
         self.spin_interval = QDoubleSpinBox(); self.spin_interval.setRange(0.1, 2.0); self.spin_interval.setSingleStep(0.1)
-        self.spin_interval.setSuffix(" m"); self.spin_interval.setValue(self._config.get("path_planning", {}).get("path_point_interval_m", 0.6))
+        self.spin_interval.setSuffix(" m"); self.spin_interval.setValue(path_cfg.get("path_point_interval_m", 0.6))
         self.spin_buffer = QDoubleSpinBox(); self.spin_buffer.setRange(0.0, 10.0); self.spin_buffer.setSingleStep(0.1)
-        self.spin_buffer.setSuffix(" m"); self.spin_buffer.setValue(self._config.get("path_planning", {}).get("headland_buffer_m", 3.0))
+        self.spin_buffer.setSuffix(" m"); self.spin_buffer.setValue(path_cfg.get("headland_buffer_m", 3.0))
+        f.addRow("作业线模式:", self.combo_work_line_mode)
+        f.addRow("验证等级:", self.combo_validation_profile)
         f.addRow("路径点间距:", self.spin_interval)
         f.addRow("田头缓冲:", self.spin_buffer)
         return w
@@ -362,6 +380,8 @@ class SettingsDialog(QDialog):
         self._config.setdefault("model", {})["tile_capture_size"] = self.spin_tile.value()
         self._config.setdefault("path_planning", {})["path_point_interval_m"] = self.spin_interval.value()
         self._config.setdefault("path_planning", {})["headland_buffer_m"] = self.spin_buffer.value()
+        self._config.setdefault("path_planning", {})["work_line_mode"] = self.combo_work_line_mode.currentData() or "band_centerline"
+        self._config.setdefault("path_planning", {})["validation_profile"] = self.combo_validation_profile.currentData() or "research"
         self._config.setdefault("mask_processing", {})["strength"] = self.combo_strength.currentData() or "standard"
         self._config.setdefault("mask_processing", {})["band_internal_gap_close_m"] = self.spin_gap.value()
         self._config.setdefault("mask_processing", {})["band_end_gap_close_m"] = self.spin_end_gap.value()

@@ -6,6 +6,7 @@ def _valid_path_result(mode="footprint_optimized"):
         "is_valid": True,
         "validation": {
             "valid": True,
+            "validation_profile": "machine_candidate",
             "field_boundary_present": True,
             "semantic_support_present": True,
             "forbidden_mask_present": True,
@@ -74,3 +75,35 @@ def test_footprint_work_line_mode_uses_generator_without_fallback(monkeypatch):
     assert lines == expected
     assert layout["work_line_mode"] == "footprint_optimized"
     assert called == {"shape": (20, 30), "angle": 0.25}
+
+
+def test_forbidden_regions_are_rasterized_in_local_mask_coordinates():
+    from footprint_planner import rasterize_forbidden_regions
+
+    class State:
+        mask_offset_x = 100
+        mask_offset_y = 200
+        forbidden_regions = [[(105, 205), (115, 205), (115, 215), (105, 215)]]
+
+    mask = rasterize_forbidden_regions((30, 30), State())
+
+    assert mask is not None
+    assert mask[10, 10] == 255
+    assert mask[0, 0] == 0
+
+
+def test_project_cache_keeps_confirmed_forbidden_regions(tmp_path):
+    from cache import _build_project_state_payload
+
+    tif_path = tmp_path / "source.tif"
+    tif_path.write_bytes(b"source")
+
+    class State:
+        source_sha256 = "test-source"
+        forbidden_regions = [[(1, 1), (5, 1), (5, 5), (1, 5)]]
+        forbidden_regions_confirmed = True
+
+    payload = _build_project_state_payload(str(tif_path), State(), "test")
+
+    assert payload["forbidden_regions"] == [[[1, 1], [5, 1], [5, 5], [1, 5]]]
+    assert payload["forbidden_regions_confirmed"] is True

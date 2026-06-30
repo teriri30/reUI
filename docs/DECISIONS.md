@@ -183,11 +183,13 @@
 **不变量**：
 
 - `work_line_mode=band_centerline` 保持现有论文流程；`footprint_optimized` 显式启用足迹代价驱动作业线，失败时不得静默回退。
+- 验证等级分为 `research`、`field_trial` 和 `machine_candidate`；结果界面必须显示当前作业线模式、验证等级和机器执行状态。
 - 未确认的不确定残差不得自动升级为禁行区；提供禁行区时，履带重叠默认硬门限为 0%。
+- 禁行区必须来自用户确认多边形，并进入项目缓存、路径 provenance、足迹验证和导出 manifest；任何修改必须使旧路径失效。
 - GeoJSON、CSV、KML、JSON 和 `$PATH` 标记为科研/人工复核导出，不得宣称为机器可执行路线。
 - 缺少外部定位精度、车辆参考几何、完整运动学、终端适配、实车跟踪验证或人工签署时，机器执行就绪评估必须失败关闭。
 
-**代码锚点**：`path_planner._prepare_work_line_layout`、`footprint_planner.validate_footprints`、`machine_route_validator.assess_machine_readiness`、`RouteInfoPanel`。
+**代码锚点**：`path_planner._prepare_work_line_layout`、`footprint_planner.validate_footprints`、`footprint_planner.rasterize_forbidden_regions`、`machine_route_validator.assess_machine_readiness`、`RouteInfoPanel`。
 
 ## 修改决策的方式
 

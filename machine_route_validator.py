@@ -33,6 +33,8 @@ def assess_machine_readiness(
         blockers.append("turn_hard_errors_present")
     if layout.get("work_line_mode") != "footprint_optimized":
         blockers.append("footprint_optimized_work_lines_not_used")
+    if validation.get("validation_profile") != "machine_candidate":
+        blockers.append("machine_validation_profile_not_used")
     if not bool(validation.get("field_boundary_present")):
         blockers.append("confirmed_field_boundary_missing")
     if not bool(validation.get("semantic_support_present")):

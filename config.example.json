@@ -43,6 +43,7 @@
   },
   "path_planning": {
     "work_line_mode": "band_centerline",
+    "validation_profile": "research",
     "min_turn_radius_m": 1.0,
     "planning_max_dim": 3600,
     "validation_max_dim": 3000,

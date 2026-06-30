@@ -461,11 +461,11 @@ class ImageViewer(QGraphicsView):
             line.setZValue(25)
             self._overlay_group.append(line)
 
-    def draw_polygon(self, pts, color=(0, 200, 80), outline=None, width=1):
+    def draw_polygon(self, pts, color=(0, 200, 80), outline=None, width=1, alpha=255):
         if len(pts) < 3:
             return None
         polygon = QPolygonF([QPointF(float(x), float(y)) for x, y in pts])
-        brush = QBrush(QColor(*reversed(color)))
+        brush = QBrush(QColor(*reversed(color), int(alpha)))
         outline_color = outline if outline is not None else color
         pen = QPen(QColor(*reversed(outline_color)), int(width))
         pen.setCosmetic(True)

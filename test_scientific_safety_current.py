@@ -118,6 +118,20 @@ def test_route_info_distinguishes_approach_turn_reverse_and_service_segments():
     app = QApplication.instance() or QApplication([])
     panel = RouteInfoPanel()
     panel.update_route({
+        "layout": {"work_line_mode": "band_centerline"},
+        "validation": {
+            "validation_profile": "research",
+            "validation_limits_pct": {
+                "track_outside_field": 2.0,
+                "track_outside_support": 100.0,
+                "track_uncertain_overlap": 100.0,
+                "track_forbidden_overlap": 0.0,
+            },
+        },
+        "machine_readiness": {
+            "eligible_for_machine_export": False,
+            "blockers": ["footprint_optimized_work_lines_not_used"],
+        },
         "ordered_segments": [
             {"segment_index": 0, "type": "work", "points": [(0, 0), (1, 0)]},
             {"segment_index": 1, "type": "turn_approach", "points": [(1, 0), (2, 0)]},
@@ -133,6 +147,10 @@ def test_route_info_distinguishes_approach_turn_reverse_and_service_segments():
     assert "接近 1" in summary
     assert "倒车 1" in summary
     assert "进出田/卸粮 1" in summary
+    assert "科研统计" in panel._safety.text()
+    assert "中心线" in panel._safety.text()
+    assert "机器执行：禁止" in panel._safety.text()
+    assert "支撑<=100" in panel._safety.toolTip()
     assert [row._segment_type for row in panel.findChildren(RouteSegmentRow)] == [
         "work", "turn_approach", "turn", "turn_reverse", "exit"
     ]
