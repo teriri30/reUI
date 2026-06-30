@@ -1473,6 +1473,7 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         detected_mask=detected_mask,
         planned_mask=planned_mask,
         headland_mask=cfg.get("headland_mask"),
+        support_mask=cfg.get("planning_support_mask"),
     )
 
     mpp = meters_per_pixel(mask, geo, state)

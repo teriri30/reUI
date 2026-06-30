@@ -19,5 +19,9 @@ jobs:
           cache-dependency-path: requirements-ci.txt
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-ci.txt
+      - name: Fix PROJ_LIB for rasterio+pyproj compatibility
+        run: |
+          $proj_data = python -c "import rasterio, os; print(os.path.join(os.path.dirname(rasterio.__file__), 'proj_data'))"
+          echo "PROJ_LIB=$proj_data" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - run: python -m compileall -q .
       - run: python -m pytest -q

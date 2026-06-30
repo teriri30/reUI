@@ -201,7 +201,7 @@ class CacheRestoreWorker(QObject):
     def run(self):
         try:
             self.progress.emit(10, "正在读取项目缓存...")
-            from cache import load_project_state, load_mask
+            from cache import load_project_state, load_mask, load_mask_bundle
             from row_geometry import MASK_REGULARIZATION_VERSION
             saved = load_project_state(self.path, self.expected_source_sha256)
             if self._cancelled or not saved:
@@ -246,10 +246,10 @@ class CacheRestoreWorker(QObject):
                 raw_mask = None
 
             self.progress.emit(65, "正在读取掩膜处理缓存...")
-            processed_mask, proc_ox, proc_oy = (
-                load_mask(self.path, "_processed")
+            processed_mask, proc_ox, proc_oy, processed_layers = (
+                load_mask_bundle(self.path, "_processed")
                 if inference_valid and saved.get("mask_processed")
-                else (None, 0, 0)
+                else (None, 0, 0, {})
             )
             processed_cache_valid = False
             mask_record = saved.get("mask_provenance") or {}
@@ -270,6 +270,7 @@ class CacheRestoreWorker(QObject):
                 saved["mask_processed"] = False
                 saved["auto_path_planned"] = False
                 processed_mask = None
+                processed_layers = {}
 
             path_cache_valid = False
             path_record = saved.get("path_provenance") or {}
@@ -319,6 +320,7 @@ class CacheRestoreWorker(QObject):
                 "raw_ox": raw_ox,
                 "raw_oy": raw_oy,
                 "processed_mask": processed_mask,
+                "processed_layers": processed_layers,
                 "proc_ox": proc_ox,
                 "proc_oy": proc_oy,
             })
@@ -436,6 +438,7 @@ class PipelineWorker(QObject):
                 "min_turn_radius_m": self.params.get("turn_radius", 2.5),
                 "turn_strategy": self.params.get("turn_strategy", "auto"),
                 "headland_mask": processed.get("headland_mask"),
+                "planning_support_mask": processed.get("planning_support_mask"),
             }
             path_result = plan_path(
                 planning_bands, processed_mask, main_angle,
@@ -628,6 +631,7 @@ class PlanWorker(QObject):
             self.progress.emit(35, "正在计算作业线与转弯段...")
             config = dict(self.config)
             config.setdefault("headland_mask", self.mask_result.get("headland_mask"))
+            config.setdefault("planning_support_mask", self.mask_result.get("planning_support_mask"))
             config["_cancel_callback"] = lambda: self._cancelled
             path_result = plan_path(
                 wide_bands, processed_mask, main_angle,
@@ -646,7 +650,10 @@ class PlanWorker(QObject):
             path_config = Config().section("path_planning")
             path_config.update({
                 key: value for key, value in self.config.items()
-                if not str(key).startswith("_") and key != "headland_mask"
+                if not str(key).startswith("_") and key not in {
+                    "headland_mask", "planning_support_mask", "uncertain_residual_mask",
+                    "neutral_support_mask",
+                }
             })
             path_inputs = {
                 "mask_fingerprint": str(

@@ -728,6 +728,7 @@ class MainWindow(QMainWindow):
             processed_mask = payload.get("processed_mask")
             proc_ox = int(payload.get("proc_ox", 0) or 0)
             proc_oy = int(payload.get("proc_oy", 0) or 0)
+            processed_layers = payload.get("processed_layers") or {}
             restored_state = {
                 k: v for k, v in saved.items()
                 if k in (
@@ -790,6 +791,19 @@ class MainWindow(QMainWindow):
                     if isinstance(mr, dict):
                         mr = dict(mr)
                         mr["processed_mask"] = processed_mask
+                        for key, value in processed_layers.items():
+                            if isinstance(value, np.ndarray) and value.shape[:2] == processed_mask.shape[:2]:
+                                mr[key] = value
+                        uncertain = mr.get("uncertain_residual_mask")
+                        if isinstance(uncertain, np.ndarray):
+                            mr["neutral_support_mask"] = uncertain
+                        support = processed_mask.copy()
+                        headland = mr.get("headland_mask")
+                        if isinstance(headland, np.ndarray):
+                            support = cv2.bitwise_or(support, headland)
+                        if isinstance(uncertain, np.ndarray):
+                            support = cv2.bitwise_or(support, uncertain)
+                        mr["planning_support_mask"] = support
                         self.state.mask_result = mr
                     self.state.mask_offset_x = proc_ox
                     self.state.mask_offset_y = proc_oy
@@ -2541,7 +2555,7 @@ class MainWindow(QMainWindow):
         wide_bands = processed.get("wide_bands", [])
         processed = self._compact_mask_result_for_ui(processed)
         processed_mask = processed.get("processed_mask", processed_mask)
-        self._save_processed_mask_async(processed_mask)
+        self._save_processed_mask_async(processed_mask, processed)
         self.state.safe_update(
             mask_processed=True,
             mask_result=processed,
@@ -2577,7 +2591,7 @@ class MainWindow(QMainWindow):
             compact[key] = items
         return compact
 
-    def _save_processed_mask_async(self, processed_mask):
+    def _save_processed_mask_async(self, processed_mask, mask_result=None):
         """Persist the large processed mask off the GUI thread.
 
         np.savez_compressed on a 15078×21021 uint8 mask can take several seconds
@@ -2589,6 +2603,12 @@ class MainWindow(QMainWindow):
             return
         ox = int(getattr(self.state, 'mask_offset_x', 0) or 0)
         oy = int(getattr(self.state, 'mask_offset_y', 0) or 0)
+        semantic_layers = {
+            key: value
+            for key in ("headland_mask", "uncertain_residual_mask")
+            if isinstance((value := (mask_result or {}).get(key)), np.ndarray)
+            and value.shape[:2] == processed_mask.shape[:2]
+        }
         with self._processed_mask_save_lock:
             self._processed_mask_save_generation += 1
             generation = self._processed_mask_save_generation
@@ -2606,6 +2626,7 @@ class MainWindow(QMainWindow):
                     oy,
                     suffix="_processed",
                     commit_callback=is_current_generation,
+                    extra_arrays=semantic_layers,
                 )
                 if not saved:
                     self._log.info("processed mask cache save skipped: superseded by newer result")
@@ -2857,6 +2878,9 @@ class MainWindow(QMainWindow):
         headland = mask_result.get("headland_mask") if isinstance(mask_result, dict) else None
         if isinstance(headland, np.ndarray) and headland.shape[:2] == mask.shape[:2]:
             viewer.draw_mask_overlay(headland, mask_x, mask_y, color=(210, 230, 120))
+        uncertain = mask_result.get("uncertain_residual_mask") if isinstance(mask_result, dict) else None
+        if isinstance(uncertain, np.ndarray) and uncertain.shape[:2] == mask.shape[:2]:
+            viewer.draw_mask_overlay(uncertain, mask_x, mask_y, color=(170, 170, 190))
         viewer.draw_mask_overlay(mask, mask_x, mask_y)
         boundary = getattr(self.state, 'field_boundary', [])
         if boundary and len(boundary) >= 3:
@@ -2884,6 +2908,9 @@ class MainWindow(QMainWindow):
             headland = mask_result.get("headland_mask") if isinstance(mask_result, dict) else None
             if isinstance(headland, np.ndarray) and headland.shape[:2] == disp_mask.shape[:2]:
                 viewer.draw_mask_overlay(headland, mask_x, mask_y, color=(210, 230, 120))
+            uncertain = mask_result.get("uncertain_residual_mask") if isinstance(mask_result, dict) else None
+            if isinstance(uncertain, np.ndarray) and uncertain.shape[:2] == disp_mask.shape[:2]:
+                viewer.draw_mask_overlay(uncertain, mask_x, mask_y, color=(170, 170, 190))
             viewer.draw_mask_overlay(disp_mask, mask_x, mask_y)
         boundary = getattr(self.state, 'field_boundary', [])
         if boundary and len(boundary) >= 3:

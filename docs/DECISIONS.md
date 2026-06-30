@@ -136,6 +136,26 @@
 
 **测试锚点**：`test_readme_preserves_research_prototype_boundary`、`test_machine_parameter_output_is_explicitly_unvalidated_heuristic`。
 
+## DECISION-009：掩膜证据层和规划支撑层必须分离
+
+**结论**：原始残差只有在方向、主体投影和米制邻近关系同时成立时，才能并入 `processed_mask`。无法可靠归属的残差进入 `uncertain_residual_mask`，不得伪装成主作业区或田头。
+
+**原因**：仅凭方向和纵向投影会把田头孤岛、道路边缘或漏检碎片错误提升为主作业区；反过来把所有残差标成田头也会制造错误语义，并污染覆盖率和碾压率评价。
+
+**不变量**：
+
+- 与重构主体不邻近的平行残差不得进入主作业区。
+- 内部断苗和端部边界使用不同补缝阈值，端部不得借用 6～9 m 的内部阈值。
+- `processed_mask` 用于作物主体和作物重叠指标；`planning_support_mask` 只用于场地支撑和越界判断。
+- 不确定残差必须独立显示，不能显示成绿色主体或黄色田头。
+- 处理后主体、田头和不确定层作为同一个原子缓存产物保存，JSON 不得承载大掩膜数组。
+
+**代码锚点**：`row_geometry.residual_mask_layers`、`row_geometry.close_band_support_gaps`、`footprint_planner.validate_footprints`、处理后掩膜缓存。
+
+**测试锚点**：`test_detached_parallel_fragment_inside_body_extent_becomes_uncertain`、`test_terminal_band_gap_uses_stricter_threshold_than_internal_gap`、`test_validate_footprints_uses_neutral_support_without_counting_it_as_crop`、`test_semantic_mask_layers_roundtrip_without_entering_json_summary`。
+
+**允许的变更方式**：可通过真实标注样本调整米制邻近阈值和端部阈值，但必须同时报告主体误增面积、主体漏保留面积、田头误分类面积和运行时间。
+
 ## 修改决策的方式
 
 决策不是永久禁止演进。需要改变时，必须在同一个变更中：

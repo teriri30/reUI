@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-MASK_REGULARIZATION_VERSION = 3
+MASK_REGULARIZATION_VERSION = 4
 
 
 def odd_size(value: float, minimum: int = 3) -> int:
@@ -168,25 +168,28 @@ def residual_mask_layers(
     raw_mask: np.ndarray,
     rebuilt_mask: np.ndarray,
     main_angle: float,
+    meters_per_px: Optional[float] = None,
+    config: Optional[Dict[str, Any]] = None,
     angle_thresh_deg: float = 60.0,
     min_area_ratio: float = 0.001,
     short_parallel_ratio: float = 0.18,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Split raw-vs-rebuilt residuals into headland and row-body residual layers.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split raw residuals into headland, attached body, and uncertain layers.
 
-    Perpendicular residual components are headland. Row-parallel residuals are
-    preserved as body support only when they are long enough to be plausible row
-    bands and remain within the main body's row-direction extent. Detached
-    parallel fragments stay in the light headland/edge layer instead of becoming
-    work-line body.
+    DECISION-009: projection overlap is not enough to promote a residual into the
+    work body. A row-parallel component must also be metrically close to the
+    rebuilt body. Ambiguous parallel fragments remain visible as uncertain
+    evidence instead of being mislabeled as headland or work-line body.
     """
+    cfg = dict(config or {})
     raw = (np.asarray(raw_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
     rebuilt = (np.asarray(rebuilt_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
     residual = cv2.bitwise_and(raw, cv2.bitwise_not(rebuilt))
     headland = np.zeros_like(raw)
     body_residual = np.zeros_like(raw)
+    uncertain = np.zeros_like(raw)
     if cv2.countNonZero(residual) == 0:
-        return headland, body_residual
+        return headland, body_residual, uncertain
 
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(residual, 8)
     threshold = math.radians(float(angle_thresh_deg))
@@ -196,12 +199,45 @@ def residual_mask_layers(
     has_rebuilt_body = cv2.countNonZero(rebuilt) > 0
     rebuilt_start, rebuilt_end = _component_projection_interval(rebuilt, main_angle)
     body_extension = max(3.0, float(short_parallel_ratio) * max(raw.shape[:2]) * 0.15)
+    attach_m = float(cfg.get("residual_body_attach_m", 0.12))
+    if meters_per_px is not None and np.isfinite(float(meters_per_px)) and float(meters_per_px) > 0:
+        attach_px = max(1.0, attach_m / float(meters_per_px))
+    else:
+        attach_px = max(2.0, max(raw.shape[:2]) * 0.01)
+    body_attachment_zone = None
+    if has_rebuilt_body:
+        attach_radius = max(1, int(math.ceil(attach_px)))
+        body_attachment_zone = cv2.dilate(
+            rebuilt,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (attach_radius * 2 + 1, attach_radius * 2 + 1),
+            ),
+            iterations=1,
+        )
+    min_attach_ratio = float(cfg.get("residual_body_min_attach_ratio", 0.02))
+    direction = np.asarray(
+        (math.cos(float(main_angle)), math.sin(float(main_angle))),
+        dtype=np.float64,
+    )
 
     for label in range(1, n_labels):
         area = int(stats[label, cv2.CC_STAT_AREA])
-        component = (labels == label).astype(np.uint8) * 255
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        label_roi = labels[y:y + height, x:x + width]
+        component_selector = label_roi == label
+        component = component_selector.astype(np.uint8) * 255
+
+        def assign_component(target: np.ndarray):
+            target_roi = target[y:y + height, x:x + width]
+            residual_roi = residual[y:y + height, x:x + width]
+            target_roi[component_selector] = residual_roi[component_selector]
+
         if area < min_area:
-            headland[labels == label] = residual[labels == label]
+            assign_component(uncertain)
             continue
 
         comp_angle = _component_main_angle(component)
@@ -209,6 +245,9 @@ def residual_mask_layers(
         diff = min(diff, math.pi - diff)
         parallel_extent = _component_extent_along_angle(component, main_angle)
         comp_start, comp_end = _component_projection_interval(component, main_angle)
+        projection_offset = float(x * direction[0] + y * direction[1])
+        comp_start += projection_offset
+        comp_end += projection_offset
         overlaps_body_extent = (
             not has_rebuilt_body
             or (
@@ -216,11 +255,18 @@ def residual_mask_layers(
                 and comp_start <= rebuilt_end + body_extension
             )
         )
-        if diff > threshold or parallel_extent < min_parallel_extent or not overlaps_body_extent:
-            headland[labels == label] = residual[labels == label]
+        if diff > threshold or not overlaps_body_extent:
+            assign_component(headland)
+        elif parallel_extent < min_parallel_extent or body_attachment_zone is None:
+            assign_component(uncertain)
         else:
-            body_residual[labels == label] = residual[labels == label]
-    return headland, body_residual
+            near_body = component_selector & (
+                body_attachment_zone[y:y + height, x:x + width] > 0
+            )
+            attach_ratio = float(np.count_nonzero(near_body) / max(area, 1))
+            target = body_residual if attach_ratio >= min_attach_ratio else uncertain
+            assign_component(target)
+    return headland, body_residual, uncertain
 
 def repair_row_gaps(
     mask: np.ndarray,
@@ -286,7 +332,7 @@ def residual_headland_mask(
     min_area_ratio: float = 0.001,
 ) -> np.ndarray:
     """Return only headland-like residual pixels, not every missed row-band pixel."""
-    headland, _body_residual = residual_mask_layers(
+    headland, _body_residual, _uncertain = residual_mask_layers(
         raw_mask,
         rebuilt_mask,
         main_angle,
@@ -487,6 +533,33 @@ def close_boolean_gaps(values: np.ndarray, max_gap: int) -> np.ndarray:
     result = np.zeros(values.size, dtype=bool)
     for start, end in runs:
         result[start:end] = True
+    return result
+
+
+def close_band_support_gaps(
+    values: np.ndarray,
+    internal_max_gap: int,
+    terminal_max_gap: int,
+    terminal_guard: int,
+) -> np.ndarray:
+    """Close dual-anchored band gaps with a stricter threshold near endpoints.
+
+    DECISION-009 prevents a terminal fragment from borrowing the much larger
+    internal missing-crop threshold and becoming a false row extension.
+    """
+    source = np.asarray(values, dtype=bool)
+    runs = _runs(source)
+    if len(runs) < 2:
+        return source.copy()
+    result = source.copy()
+    guard = max(0, int(terminal_guard))
+    for left, right in zip(runs, runs[1:]):
+        gap_start, gap_end = left[1], right[0]
+        gap = gap_end - gap_start
+        terminal = left[0] <= guard or right[1] >= source.size - guard
+        limit = int(terminal_max_gap if terminal else internal_max_gap)
+        if gap <= max(0, limit):
+            result[gap_start:gap_end] = True
     return result
 
 
@@ -719,8 +792,15 @@ def regularize_crop_mask(
     abort_if_cancelled()
     raw = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
     if np.count_nonzero(raw) < 100:
+        empty_layer = np.zeros_like(raw)
         return {
             "processed_mask": raw,
+            "regularized_body_mask": raw.copy(),
+            "body_residual_mask": empty_layer.copy(),
+            "headland_mask": empty_layer.copy(),
+            "uncertain_residual_mask": empty_layer.copy(),
+            "neutral_support_mask": empty_layer.copy(),
+            "planning_support_mask": raw.copy(),
             "main_angle": 0.0,
             "wide_bands": [],
             "narrow_bands": [],
@@ -1055,7 +1135,21 @@ def regularize_crop_mask(
         trusted_seed = center_trusted & np.isfinite(center_observed)
         if np.count_nonzero(trusted_seed) >= int(cfg.get("min_band_observations", 4)):
             extent_seed = trusted_seed
-        extent_mask = close_boolean_gaps(extent_seed, internal_gap_samples)
+        terminal_gap_samples = int(round(
+            float(cfg.get(
+                "band_end_gap_close_m",
+                cfg.get("band_endpoint_gap_close_m", 0.35),
+            )) / sample_m
+        ))
+        terminal_guard_samples = int(round(
+            float(cfg.get("band_end_guard_m", 1.0)) / sample_m
+        ))
+        extent_mask = close_band_support_gaps(
+            extent_seed,
+            internal_max_gap=internal_gap_samples,
+            terminal_max_gap=terminal_gap_samples,
+            terminal_guard=terminal_guard_samples,
+        )
         extent_runs = _runs(extent_mask)
         if not extent_runs:
             skipped_bands.append({
@@ -1204,10 +1298,12 @@ def regularize_crop_mask(
     narrow = [item for item in bands if item.get("band_type") == "narrow"]
     raw_bool = raw > 0
     rebuilt_bool = rebuilt > 0
-    headland_mask, body_residual_mask = residual_mask_layers(
+    headland_mask, body_residual_mask, uncertain_residual_mask = residual_mask_layers(
         raw,
         rebuilt,
         angle,
+        meters_per_px=mpp,
+        config=cfg,
         angle_thresh_deg=float(cfg.get("headland_angle_thresh_deg", 60.0)),
         min_area_ratio=float(cfg.get("headland_min_area_ratio", 0.001)),
     )
@@ -1216,7 +1312,11 @@ def regularize_crop_mask(
     visible_body = constrain_generated_body_to_raw_support(visible_body, raw, angle, mpp, cfg)
     visible_body_bool = visible_body > 0
     headland_bool = headland_mask > 0
-    planning_support_mask = cv2.bitwise_or(visible_body, headland_mask)
+    neutral_support_mask = uncertain_residual_mask
+    planning_support_mask = cv2.bitwise_or(
+        cv2.bitwise_or(visible_body, headland_mask),
+        neutral_support_mask,
+    )
     intersection = int(np.count_nonzero(raw_bool & visible_body_bool))
     union = int(np.count_nonzero(raw_bool | visible_body_bool))
     diagnostics = {
@@ -1233,6 +1333,7 @@ def regularize_crop_mask(
         "recall_to_raw": float(intersection / max(np.count_nonzero(raw_bool), 1)),
         "iou_to_raw": float(intersection / max(union, 1)),
         "headland_removed_px": int(np.count_nonzero(headland_bool)),
+        "uncertain_residual_px": int(np.count_nonzero(uncertain_residual_mask)),
         "body_interval": body_diagnostics,
         "candidate_band_count": len(runs),
         "rebuilt_band_count": len(bands),
@@ -1250,6 +1351,8 @@ def regularize_crop_mask(
         "regularized_body_mask": rebuilt,
         "body_residual_mask": body_residual_mask,
         "headland_mask": headland_mask,
+        "uncertain_residual_mask": uncertain_residual_mask,
+        "neutral_support_mask": neutral_support_mask,
         "planning_support_mask": planning_support_mask,
         "main_angle": float(angle),
         "wide_bands": wide,

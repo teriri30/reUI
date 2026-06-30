@@ -203,6 +203,41 @@ def test_cache_loader_never_reuses_same_shape_mask_from_another_source(tmp_path,
     assert cache.load_preferred_cache(str(second), image_shape=(10, 10)) is None
 
 
+def test_semantic_mask_layers_roundtrip_without_entering_json_summary(tmp_path, monkeypatch):
+    """DECISION-009: dense semantic layers remain atomic binary artifacts."""
+    import cache
+
+    monkeypatch.setattr(cache, "CACHE_ROOT", str(tmp_path / "cache"))
+    body = np.zeros((20, 30), dtype=np.uint8)
+    body[8:12, 4:26] = 255
+    headland = np.zeros_like(body)
+    headland[:, :3] = 255
+    uncertain = np.zeros_like(body)
+    uncertain[2:5, 10:15] = 255
+
+    cache.save_mask(
+        "D:/fake/source.tif",
+        body,
+        suffix="_processed",
+        extra_arrays={
+            "headland_mask": headland,
+            "uncertain_residual_mask": uncertain,
+        },
+    )
+    loaded, _x, _y, layers = cache.load_mask_bundle("D:/fake/source.tif", "_processed")
+    summary = cache._mask_result_summary({
+        "processed_mask": body,
+        "headland_mask": headland,
+        "uncertain_residual_mask": uncertain,
+        "main_angle": 0.1,
+    })
+
+    assert np.array_equal(loaded, body)
+    assert np.array_equal(layers["headland_mask"], headland)
+    assert np.array_equal(layers["uncertain_residual_mask"], uncertain)
+    assert summary == {"main_angle": 0.1}
+
+
 def test_metric_processing_rejects_anisotropic_raster_pixels():
     """DECISION-003: unsupported anisotropic scale cannot enter metric processing."""
     from pyside6_app.workers import require_metric_scale

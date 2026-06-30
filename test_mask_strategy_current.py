@@ -36,15 +36,90 @@ def test_detached_parallel_fragment_outside_body_extent_does_not_enter_body_resi
     raw[40:46, 20:150] = 255
     raw[85:91, 166:216] = 255
 
-    headland, body_residual = residual_mask_layers(
+    headland, body_residual, uncertain = residual_mask_layers(
         raw,
         rebuilt,
         main_angle=0.0,
+        meters_per_px=0.1,
         min_area_ratio=0.001,
     )
 
     assert body_residual[87, 190] == 0
     assert headland[87, 190] == 255
+    assert uncertain[87, 190] == 0
+
+
+def test_detached_parallel_fragment_inside_body_extent_becomes_uncertain():
+    """DECISION-009: projection overlap alone cannot promote a detached fragment."""
+    from row_geometry import residual_mask_layers
+
+    raw = np.zeros((120, 240), dtype=np.uint8)
+    rebuilt = np.zeros_like(raw)
+    rebuilt[35:43, 20:190] = 255
+    raw[35:43, 20:190] = 255
+    raw[80:88, 145:215] = 255
+
+    headland, body_residual, uncertain = residual_mask_layers(
+        raw,
+        rebuilt,
+        main_angle=0.0,
+        meters_per_px=0.1,
+        min_area_ratio=0.001,
+    )
+
+    assert np.count_nonzero(body_residual[80:88, 145:215]) == 0
+    assert np.count_nonzero(headland[80:88, 145:215]) == 0
+    assert np.count_nonzero(uncertain[80:88, 145:215]) == 560
+
+
+def test_adjacent_parallel_residual_remains_attached_to_body():
+    """DECISION-009: nearby raw edge evidence remains part of the work body."""
+    from row_geometry import residual_mask_layers
+
+    raw = np.zeros((100, 180), dtype=np.uint8)
+    rebuilt = np.zeros_like(raw)
+    rebuilt[40:48, 20:160] = 255
+    raw[40:51, 20:160] = 255
+
+    headland, body_residual, uncertain = residual_mask_layers(
+        raw,
+        rebuilt,
+        main_angle=0.0,
+        meters_per_px=0.05,
+        min_area_ratio=0.001,
+    )
+
+    assert np.count_nonzero(body_residual[48:51, 20:160]) == 420
+    assert np.count_nonzero(headland) == 0
+    assert np.count_nonzero(uncertain) == 0
+
+
+def test_terminal_band_gap_uses_stricter_threshold_than_internal_gap():
+    """DECISION-009: a detached terminal fragment cannot use the internal gap limit."""
+    from row_geometry import close_band_support_gaps
+
+    seed = np.zeros(100, dtype=bool)
+    seed[10:70] = True
+    seed[76:98] = True
+
+    closed = close_band_support_gaps(
+        seed,
+        internal_max_gap=10,
+        terminal_max_gap=3,
+        terminal_guard=5,
+    )
+
+    assert not np.any(closed[70:76])
+
+    seed[76:98] = False
+    seed[76:86] = True
+    closed_internal = close_band_support_gaps(
+        seed,
+        internal_max_gap=10,
+        terminal_max_gap=3,
+        terminal_guard=5,
+    )
+    assert np.all(closed_internal[70:76])
 
 
 def test_generated_body_keeps_internal_gap_fill_but_removes_isolated_fragment():

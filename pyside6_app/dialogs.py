@@ -345,10 +345,14 @@ class SettingsDialog(QDialog):
                 break
         self.spin_gap = QDoubleSpinBox(); self.spin_gap.setRange(0.2, 20.0); self.spin_gap.setSingleStep(0.5)
         self.spin_gap.setSuffix(" m"); self.spin_gap.setValue(self._config.get("mask_processing", {}).get("band_internal_gap_close_m", 6.0))
+        self.spin_end_gap = QDoubleSpinBox(); self.spin_end_gap.setRange(0.0, 2.0); self.spin_end_gap.setSingleStep(0.05)
+        mask_cfg = self._config.get("mask_processing", {})
+        self.spin_end_gap.setSuffix(" m"); self.spin_end_gap.setValue(mask_cfg.get("band_end_gap_close_m", mask_cfg.get("band_endpoint_gap_close_m", 0.35)))
         self.spin_trim = QDoubleSpinBox(); self.spin_trim.setRange(0.0, 2.0); self.spin_trim.setSingleStep(0.05)
         self.spin_trim.setSuffix(" m"); self.spin_trim.setValue(self._config.get("mask_processing", {}).get("band_end_trim_m", 0.1))
         f.addRow("处理强度:", self.combo_strength)
         f.addRow("行内断裂补全:", self.spin_gap)
+        f.addRow("端部断裂补全:", self.spin_end_gap)
         f.addRow("端部收缩:", self.spin_trim)
         return w
 
@@ -360,6 +364,7 @@ class SettingsDialog(QDialog):
         self._config.setdefault("path_planning", {})["headland_buffer_m"] = self.spin_buffer.value()
         self._config.setdefault("mask_processing", {})["strength"] = self.combo_strength.currentData() or "standard"
         self._config.setdefault("mask_processing", {})["band_internal_gap_close_m"] = self.spin_gap.value()
+        self._config.setdefault("mask_processing", {})["band_end_gap_close_m"] = self.spin_end_gap.value()
         self._config.setdefault("mask_processing", {})["band_end_trim_m"] = self.spin_trim.value()
         cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "config.json")
         save_json_atomic(os.path.abspath(cfg_path), self._config)

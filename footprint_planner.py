@@ -421,7 +421,13 @@ def validate_footprints(
     detected_mask: Optional[np.ndarray] = None,
     planned_mask: Optional[np.ndarray] = None,
     headland_mask: Optional[np.ndarray] = None,
+    support_mask: Optional[np.ndarray] = None,
 ) -> Dict:
+    """Validate footprints without conflating crop evidence and field support.
+
+    DECISION-009 keeps crop overlap based on ``processed_mask`` while the
+    separate support mask is used only for field-boundary support checks.
+    """
     cfg = config or {}
     if headland_mask is None:
         headland_mask = cfg.get("headland_mask")
@@ -477,7 +483,16 @@ def validate_footprints(
                 interpolation=cv2.INTER_AREA,
             )
             headland = (headland >= 96).astype(np.uint8) * 255
-    support_source = raw if headland is None else cv2.bitwise_or(raw, (np.asarray(headland_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255)
+    support_source = raw
+    if support_mask is not None:
+        candidate_support = (np.asarray(support_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+        if candidate_support.shape[:2] == raw.shape[:2]:
+            support_source = candidate_support
+    elif headland is not None:
+        support_source = cv2.bitwise_or(
+            raw,
+            (np.asarray(headland_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255,
+        )
     support = cv2.resize(
         _field_support(support_source, state),
         (soft.shape[1], soft.shape[0]),

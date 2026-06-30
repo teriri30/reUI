@@ -32,15 +32,24 @@ def test_residual_headland_mask_filters_missed_row_band_by_orientation():
     raw[10:15, 18:35] = 255      # short parallel edge replanting fragment: headland/edge layer
     rebuilt = np.zeros_like(raw)
 
-    headland, body_residual = residual_mask_layers(raw, rebuilt, 0.0, angle_thresh_deg=45.0, min_area_ratio=0.001)
+    headland, body_residual, uncertain = residual_mask_layers(
+        raw,
+        rebuilt,
+        0.0,
+        meters_per_px=0.05,
+        angle_thresh_deg=45.0,
+        min_area_ratio=0.001,
+    )
     headland_only = residual_headland_mask(raw, rebuilt, 0.0, angle_thresh_deg=45.0, min_area_ratio=0.001)
 
     assert headland[32, 30] == 0
-    assert body_residual[32, 30] == 255
+    assert body_residual[32, 30] == 0
+    assert uncertain[32, 30] == 255
     assert headland[40, 155] == 255
     assert body_residual[40, 155] == 0
-    assert headland[12, 25] == 255
+    assert headland[12, 25] == 0
     assert body_residual[12, 25] == 0
+    assert uncertain[12, 25] == 255
     assert np.array_equal(headland_only, headland)
 
 

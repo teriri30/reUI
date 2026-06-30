@@ -777,7 +777,30 @@ def test_validate_footprints_reports_headland_overlap_separately():
     assert metrics["track_core_overlap_pct"] == 0
 
 
-def test_mask_overlay_draws_headland_as_separate_light_layer(monkeypatch):
+def test_validate_footprints_uses_neutral_support_without_counting_it_as_crop():
+    """DECISION-009: neutral support affects bounds, not crop-overlap evidence."""
+    from footprint_planner import validate_footprints
+
+    body = np.zeros((80, 120), dtype=np.uint8)
+    body[35:45, 60:100] = 255
+    support = body.copy()
+    support[10:70, 2:20] = 255
+    path = [[(10.0, 15.0), (10.0, 65.0)]]
+
+    metrics = validate_footprints(
+        path,
+        body,
+        harvester={"cutter_width_m": 0.04, "track_width_m": 0.04, "track_gauge_m": 0.0},
+        support_mask=support,
+        segment_types=["turn"],
+    )
+
+    assert metrics["track_outside_field_pct"] == 0
+    assert metrics["track_core_overlap_pct"] == 0
+
+
+def test_mask_overlay_draws_headland_and_uncertain_as_separate_layers(monkeypatch):
+    """DECISION-009: uncertain residuals must not look like work-body pixels."""
     window = _window()
     window._tif_rgb = np.zeros((80, 120, 3), dtype=np.uint8)
     window.image_view.set_image(window._tif_rgb)
@@ -785,7 +808,13 @@ def test_mask_overlay_draws_headland_as_separate_light_layer(monkeypatch):
     body[35:45, 20:100] = 255
     headland = np.zeros_like(body)
     headland[10:70, 2:14] = 255
-    window.state.mask_result = {"processed_mask": body, "headland_mask": headland}
+    uncertain = np.zeros_like(body)
+    uncertain[15:25, 40:55] = 255
+    window.state.mask_result = {
+        "processed_mask": body,
+        "headland_mask": headland,
+        "uncertain_residual_mask": uncertain,
+    }
     calls = []
 
     def fake_draw(mask, x=0, y=0, color=(120, 255, 140), max_dim=2200):
@@ -797,4 +826,6 @@ def test_mask_overlay_draws_headland_as_separate_light_layer(monkeypatch):
 
     assert calls[0][0] is headland
     assert calls[0][1] != calls[1][1]
-    assert calls[1][0] is body
+    assert calls[1][0] is uncertain
+    assert calls[2][0] is body
+    assert len({calls[0][1], calls[1][1], calls[2][1]}) == 3

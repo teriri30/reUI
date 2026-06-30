@@ -131,7 +131,8 @@ def has_cache(tif_path: str, suffix: str = "") -> bool:
 
 
 def save_mask(tif_path: str, mask: np.ndarray, offset_x: int = 0, offset_y: int = 0,
-              suffix: str = "", meta: dict = None, commit_callback=None):
+              suffix: str = "", meta: dict = None, commit_callback=None,
+              extra_arrays: Optional[Dict[str, np.ndarray]] = None):
     """保存掩码到缓存"""
     d = _cache_dir(tif_path)
     os.makedirs(d, exist_ok=True)
@@ -140,12 +141,17 @@ def save_mask(tif_path: str, mask: np.ndarray, offset_x: int = 0, offset_y: int 
         f"{target}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp.npz"
     )
     try:
-        np.savez_compressed(
-            temporary,
-            mask=mask,
-            offset_x=offset_x,
-            offset_y=offset_y,
-        )
+        payload = {
+            "mask": np.asarray(mask),
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+        }
+        for key, value in dict(extra_arrays or {}).items():
+            array = np.asarray(value)
+            if array.shape[:2] != np.asarray(mask).shape[:2]:
+                raise ValueError(f"cached mask layer {key!r} has a different shape")
+            payload[str(key)] = array
+        np.savez_compressed(temporary, **payload)
         if commit_callback is not None and not bool(commit_callback()):
             return False
         os.replace(temporary, target)
@@ -192,11 +198,16 @@ def _jsonable(value):
 def _mask_result_summary(mask_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not mask_result:
         return None
-    # processed_mask is already stored in mask_smoothed.npz.
+    # Dense semantic layers are stored together in mask_processed.npz.
+    dense_mask_keys = {
+        "processed_mask", "raw_mask", "debug_images", "regularized_body_mask",
+        "body_residual_mask", "headland_mask", "uncertain_residual_mask",
+        "neutral_support_mask", "planning_support_mask",
+    }
     keep = {
         key: value
         for key, value in mask_result.items()
-        if key not in {"processed_mask", "raw_mask", "debug_images"}
+        if key not in dense_mask_keys
     }
     return _jsonable(keep)
 
@@ -443,6 +454,24 @@ def save_image_cache(tif_path: str, image_bgr: np.ndarray) -> None:
             "shape": list(image_bgr.shape),
         }, f, ensure_ascii=False, indent=2)
     os.replace(meta_temporary, meta_target)
+
+
+def load_mask_bundle(
+    tif_path: str,
+    suffix: str = "",
+) -> Tuple[Optional[np.ndarray], int, int, Dict[str, np.ndarray]]:
+    """Load a mask and its semantic layers from one atomic artifact."""
+    p = _mask_path(tif_path, suffix)
+    if not os.path.exists(p):
+        return None, 0, 0, {}
+    with np.load(p, allow_pickle=False) as data:
+        mask = np.asarray(data["mask"]).copy()
+        extras = {
+            key: np.asarray(data[key]).copy()
+            for key in data.files
+            if key not in {"mask", "offset_x", "offset_y"}
+        }
+        return mask, int(data["offset_x"]), int(data["offset_y"]), extras
 
 
 def load_mask(tif_path: str, suffix: str = "") -> Tuple[Optional[np.ndarray], int, int]:

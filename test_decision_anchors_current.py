@@ -47,6 +47,12 @@ DECISION_ANCHORS = {
         "README.md",
         "test_scientific_safety_current.py",
     ),
+    "DECISION-009": (
+        "docs/DECISIONS.md",
+        "row_geometry.py",
+        "footprint_planner.py",
+        "test_mask_strategy_current.py",
+    ),
 }
 
 

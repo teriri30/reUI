@@ -53,7 +53,12 @@
     "strength": "standard",
     "max_work_dim": 5000,
     "band_width_threshold_m": 0.55,
-    "band_auto_calibrate": true
+    "band_auto_calibrate": true,
+    "band_internal_gap_close_m": 6.0,
+    "band_end_gap_close_m": 0.35,
+    "band_end_guard_m": 1.0,
+    "residual_body_attach_m": 0.12,
+    "residual_body_min_attach_ratio": 0.02
   },
   "raster_preprocessing": {
     "mode": "percentile_per_band",

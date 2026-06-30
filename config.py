@@ -67,6 +67,13 @@ def validate_config(raw: dict) -> dict:
         raise ConfigValidationError("strength must be light, standard, strong, or very_strong")
     _validated_number(mask, "max_work_dim", minimum=256)
     _validated_number(mask, "band_width_threshold_m", minimum=0.0, strict_min=True)
+    for key in (
+        "band_internal_gap_close_m", "band_end_gap_close_m",
+        "band_endpoint_gap_close_m", "band_end_guard_m",
+        "residual_body_attach_m",
+    ):
+        _validated_number(mask, key, minimum=0.0)
+    _validated_number(mask, "residual_body_min_attach_ratio", minimum=0.0, maximum=1.0)
 
     raster = raw.get("raster_preprocessing", {})
     if "mode" in raster and str(raster["mode"]) not in {
