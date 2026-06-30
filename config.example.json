@@ -54,8 +54,8 @@
     "max_track_core_overlap_pct": 8.0,
     "min_harvest_coverage_pct": 90.0,
     "max_track_outside_field_pct": 2.0,
-    "max_track_outside_support_pct": 100.0,
-    "max_track_uncertain_overlap_pct": 100.0,
+    "max_track_outside_support_pct": 5.0,
+    "max_track_uncertain_overlap_pct": 10.0,
     "max_track_forbidden_overlap_pct": 0.0
   },
   "mask_processing": {

@@ -247,6 +247,8 @@ class TaskPanel(QWidget):
     mask_strength_changed = Signal(str)
     turn_strategy_changed = Signal(str)
     usage_mode_changed = Signal(str)
+    confirm_no_forbidden_requested = Signal()
+    draw_forbidden_requested = Signal()
     route_edit_requested = Signal()
     step_deleted = Signal(str)
 
@@ -256,6 +258,8 @@ class TaskPanel(QWidget):
         self._step_cards = []
         self._current_step = 0
         self._manual_step = None
+        self._forbidden_count = 0
+        self._forbidden_confirmed = False
         self._build_ui()
 
     def _build_ui(self):
@@ -287,10 +291,10 @@ class TaskPanel(QWidget):
                         f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;font-family:{UI_FONT};}}"
                     )
                     for label, key in [
-                        ("轻量/快速", "light"),
-                        ("标准", "standard"),
-                        ("增强", "strong"),
-                        ("强力", "very_strong"),
+                        ("速度优先", "light"),
+                        ("标准（推荐）", "standard"),
+                        ("漏检较多", "strong"),
+                        ("严重断行", "very_strong"),
                     ]:
                         self.mask_strength_combo.addItem(label, key)
                     self.mask_strength_combo.currentIndexChanged.connect(self._on_mask_strength_changed)
@@ -309,16 +313,16 @@ class TaskPanel(QWidget):
                     usage_label = QLabel("使用模式")
                     usage_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};padding-left:8px;")
                     self.usage_mode_combo = QComboBox()
-                    self.usage_mode_combo.setToolTip("快速查看用于论文对照；田间试验启用足迹优化；严格上机检查采用最严格软件门限")
+                    self.usage_mode_combo.setToolTip("快速预览用于论文对照；田间试验启用足迹优化；高级校验检查更多试跑条件")
                     self.usage_mode_combo.setMinimumHeight(30)
                     self.usage_mode_combo.setStyleSheet(
                         f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
                         f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;font-family:{UI_FONT};}}"
                     )
                     for label, key in [
-                        ("快速查看（中心线）", "quick"),
+                        ("快速预览", "quick"),
                         ("田间试验（推荐）", "field_trial"),
-                        ("严格上机检查", "machine_candidate"),
+                        ("高级校验", "machine_candidate"),
                     ]:
                         self.usage_mode_combo.addItem(label, key)
                     self.usage_mode_combo.currentIndexChanged.connect(
@@ -328,6 +332,31 @@ class TaskPanel(QWidget):
                     )
                     rows.append(usage_label)
                     rows.append(self.usage_mode_combo)
+                    forbidden_row = QWidget()
+                    forbidden_layout = QHBoxLayout(forbidden_row)
+                    forbidden_layout.setContentsMargins(8, 0, 8, 2)
+                    forbidden_layout.setSpacing(6)
+                    self.forbidden_status_label = QLabel("禁行区：未确认")
+                    self.forbidden_status_label.setStyleSheet(
+                        f"color:{COLORS['orange']};font-size:12px;font-family:{UI_FONT};"
+                    )
+                    self.confirm_no_forbidden_btn = QPushButton("确认无")
+                    self.draw_forbidden_btn = QPushButton("绘制")
+                    for button in (self.confirm_no_forbidden_btn, self.draw_forbidden_btn):
+                        button.setMinimumHeight(28)
+                        button.setStyleSheet(
+                            f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
+                            f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;font-family:{UI_FONT};}}"
+                            f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
+                        )
+                    self.confirm_no_forbidden_btn.setToolTip("确认田块内没有需要避让的沟渠、水坑或障碍")
+                    self.draw_forbidden_btn.setToolTip("在影像上绘制不可通行区域")
+                    self.confirm_no_forbidden_btn.clicked.connect(self.confirm_no_forbidden_requested.emit)
+                    self.draw_forbidden_btn.clicked.connect(self.draw_forbidden_requested.emit)
+                    forbidden_layout.addWidget(self.forbidden_status_label, 1)
+                    forbidden_layout.addWidget(self.confirm_no_forbidden_btn)
+                    forbidden_layout.addWidget(self.draw_forbidden_btn)
+                    rows.append(forbidden_row)
                     turn_label = QLabel("调头方式")
                     turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};padding-left:8px;")
                     self.turn_combo = QComboBox()
@@ -486,6 +515,26 @@ class TaskPanel(QWidget):
             self.usage_mode_combo.setCurrentIndex(index)
             self.usage_mode_combo.blockSignals(False)
 
+    def set_forbidden_state(self, count, confirmed):
+        if not hasattr(self, "forbidden_status_label"):
+            return
+        count = int(count or 0)
+        self._forbidden_count = count
+        self._forbidden_confirmed = bool(confirmed)
+        if count:
+            text = f"禁行区：已绘制 {count} 处"
+            color = COLORS["red"]
+        elif confirmed:
+            text = "禁行区：已确认无"
+            color = COLORS["green"]
+        else:
+            text = "禁行区：未确认"
+            color = COLORS["orange"]
+        self.forbidden_status_label.setText(text)
+        self.forbidden_status_label.setStyleSheet(
+            f"color:{color};font-size:12px;font-family:{UI_FONT};"
+        )
+
     def set_model_options(self, models, current=""):
         if not hasattr(self, 'model_combo'): return
         self.model_combo.blockSignals(True)
@@ -528,6 +577,15 @@ class TaskPanel(QWidget):
                 f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
                 f"QPushButton:disabled{{color:{COLORS.get('text_dim', '#8B909A')};}}"
             )
+        for button_name in ("confirm_no_forbidden_btn", "draw_forbidden_btn"):
+            button = getattr(self, button_name, None)
+            if button:
+                button.setStyleSheet(
+                    f"QPushButton{{background:{COLORS['bg_light']};color:{COLORS['text']};"
+                    f"border:1px solid {COLORS['border']};border-radius:4px;padding:3px 8px;font-family:{UI_FONT};}}"
+                    f"QPushButton:hover{{background:{COLORS['bg_hover']};}}"
+                )
+        self.set_forbidden_state(self._forbidden_count, self._forbidden_confirmed)
         for row in self.findChildren(TaskRow):
             row.refresh_theme()
         for card in self._step_cards:
@@ -577,7 +635,7 @@ class RouteInfoPanel(QWidget):
         self._summary.setWordWrap(True)
         self._summary.setMinimumWidth(0)
         self._summary.setStyleSheet(f"font-size:11px;color:{COLORS['text_dim']};padding:2px 14px 4px;")
-        self._safety = QLabel("路径等级：未评估")
+        self._safety = QLabel("路径状态：未评估")
         self._safety.setWordWrap(True)
         self._safety.setStyleSheet(f"font-size:11px;color:{COLORS['orange']};padding:2px 14px 6px;")
         lo.addWidget(self._title_hdr); lo.addWidget(self._summary); lo.addWidget(self._safety)
@@ -621,47 +679,53 @@ class RouteInfoPanel(QWidget):
                 segment_type == "work", segment_type=segment_type,
             )
             row.clicked.connect(self.segment_selected.emit); self._add_row(row)
-        parts = [f"作业线 {counts.get('work', 0)}", f"正式调头 {counts.get('turn', 0)}"]
-        if counts.get("turn_approach"): parts.append(f"接近 {counts['turn_approach']}")
-        if counts.get("turn_reverse"): parts.append(f"倒车 {counts['turn_reverse']}")
+        detail_parts = [f"作业线 {counts.get('work', 0)}", f"正式调头 {counts.get('turn', 0)}"]
+        if counts.get("turn_approach"): detail_parts.append(f"接近 {counts['turn_approach']}")
+        if counts.get("turn_reverse"): detail_parts.append(f"倒车 {counts['turn_reverse']}")
         service_count = sum(counts.get(key, 0) for key in ("entry", "exit", "unload"))
-        if service_count: parts.append(f"进出田/卸粮 {service_count}")
+        if service_count: detail_parts.append(f"进出田/卸粮 {service_count}")
         total = float(validation.get("total_length_m", data.get("total_length_m", 0.0)) or 0.0)
         work = float(validation.get("work_length_m", data.get("work_length_m", 0.0)) or 0.0)
         turn = float(validation.get("turn_length_m", data.get("turn_length_m", 0.0)) or 0.0)
-        coverage = validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct"))
-        rolling = validation.get("track_core_overlap_pct", validation.get("rolling_crop_pct"))
+        coverage = validation.get("planned_target_coverage_pct", validation.get("harvest_coverage_pct"))
+        rolling = validation.get("rolling_crop_pct", validation.get("track_core_overlap_pct"))
+        outside = validation.get("track_outside_field_pct")
+        forbidden = validation.get("track_forbidden_overlap_pct")
         efficiency = validation.get("field_efficiency_pct", validation.get("field_efficiency"))
-        if total > 0: parts.append(f"总长 {total:.1f}m")
-        if work > 0: parts.append(f"作业 {work:.1f}m")
-        if turn > 0: parts.append(f"转弯 {turn:.1f}m")
-        if coverage is not None: parts.append(f"覆盖 {float(coverage):.1f}%")
-        if rolling is not None: parts.append(f"碾压 {float(rolling):.1f}%")
-        if efficiency is not None: parts.append(f"效率 {float(efficiency):.1f}%")
+        if total > 0: detail_parts.append(f"总长 {total:.1f}m")
+        if work > 0: detail_parts.append(f"作业 {work:.1f}m")
+        if turn > 0: detail_parts.append(f"转弯 {turn:.1f}m")
+        if coverage is not None: detail_parts.append(f"覆盖 {float(coverage):.1f}%")
+        if rolling is not None: detail_parts.append(f"碾压 {float(rolling):.1f}%")
+        if efficiency is not None: detail_parts.append(f"效率 {float(efficiency):.1f}%")
         issues = validation.get("issues") or []
-        if issues: parts.append(f"风险 {len(issues)}处")
-        self._summary.setToolTip(" / ".join(parts))
-        if len(parts) > 4:
-            self._summary.setText(" / ".join(parts[:4]) + f" / … 共{len(parts)}项")
-        else:
-            self._summary.setText(" / ".join(parts))
+        if issues: detail_parts.append(f"风险 {len(issues)}处")
+        main_parts = [
+            f"预计碾压 {float(rolling):.1f}%" if rolling is not None else "预计碾压 --",
+            f"割台覆盖 {float(coverage):.1f}%" if coverage is not None else "割台覆盖 --",
+            f"越界 {float(outside):.1f}%" if outside is not None else "越界 --",
+            f"禁行区 {float(forbidden):.1f}%" if forbidden is not None else "禁行区 未确认",
+            f"总长 {total:.1f}m" if total > 0 else "总长 --",
+        ]
+        self._summary.setText(" / ".join(main_parts))
+        self._summary.setToolTip(" / ".join(detail_parts))
         readiness = data.get("machine_readiness", {}) or {}
         mode = str((data.get("layout", {}) or {}).get("work_line_mode", "band_centerline"))
         profile = str(validation.get("validation_profile", "research"))
         mode_label = "足迹优化" if mode == "footprint_optimized" else "中心线"
         profile_label = {
-            "research": "快速查看", "field_trial": "田间试验",
-            "machine_candidate": "严格上机检查",
+            "research": "快速预览", "field_trial": "田间试验",
+            "machine_candidate": "高级校验",
         }.get(profile, profile)
-        eligible = bool(readiness.get("eligible_for_machine_export", False))
         trial_ready = bool(readiness.get("controlled_trial_ready", False))
-        execution_label = (
-            "机器候选" if eligible
-            else ("田间试验待人工复核" if trial_ready else "未就绪")
-        )
+        if not bool(validation.get("valid", False)):
+            execution_label = "不建议导出"
+        elif trial_ready:
+            execution_label = "可田间试验（需人工看护）"
+        else:
+            execution_label = "需人工复核"
         self._safety.setText(
-            f"路径等级：{profile_label} | {mode_label} | "
-            f"{execution_label}"
+            f"路径状态：{execution_label} | 模式：{profile_label}·{mode_label}"
         )
         blockers = list(readiness.get("blockers") or [])
         blocker_labels = {
@@ -669,7 +733,7 @@ class RouteInfoPanel(QWidget):
             "turn_hard_errors_present": "调头轨迹存在硬错误",
             "footprint_optimized_work_lines_not_used": "未启用足迹优化",
             "field_trial_validation_profile_not_used": "未启用田间试验检查",
-            "machine_validation_profile_not_used": "未启用严格上机检查",
+            "machine_validation_profile_not_used": "未启用高级校验",
             "confirmed_field_boundary_missing": "田块边界未确认",
             "semantic_support_missing": "场地支撑层缺失",
             "confirmed_forbidden_map_missing": "禁行区尚未确认",
@@ -708,7 +772,7 @@ class RouteInfoPanel(QWidget):
         if work_len > 0: parts.append(f"作业 {work_len:.1f}m")
         if turn_len > 0: parts.append(f"转弯 {turn_len:.1f}m")
         self._summary.setText(" / ".join(parts))
-        self._safety.setText("路径等级：手动编辑/未重新验证 | 机器执行：禁止")
+        self._safety.setText("路径状态：手动编辑后需重新验证")
         self._safety.setToolTip("手动编辑后必须重新规划并完成全部验证")
     def update_service_points(self, entry_point=None, exit_point=None, unload_points=None):
         self._clear_list(); items=[]
@@ -719,11 +783,11 @@ class RouteInfoPanel(QWidget):
         for row_idx,(kind,point_idx,label,is_work) in enumerate(items):
             row=RouteSegmentRow(row_idx,label,0.0,is_work); row.clicked.connect(lambda _r,k=kind,i=point_idx: self.service_point_selected.emit(k,i)); self._add_row(row)
         self._summary.setText(f"起终点与卸粮点 {len(items)}")
-        self._safety.setText("路径等级：尚未规划")
+        self._safety.setText("路径状态：尚未规划")
         self._safety.setToolTip("")
     def clear_info(self):
         self._clear_list(); self._empty_label.setVisible(True); self._summary.setText("作业线 0 / 转弯段 0")
-        self._safety.setText("路径等级：未评估"); self._safety.setToolTip("")
+        self._safety.setText("路径状态：未评估"); self._safety.setToolTip("")
     def refresh_theme(self):
         self._title_hdr.setStyleSheet(f"font-size:13px;font-weight:600;color:{COLORS['text']};padding:8px 14px 2px;")
         self._summary.setStyleSheet(f"font-size:11px;color:{COLORS['text_dim']};padding:2px 14px 4px;")

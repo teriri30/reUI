@@ -107,7 +107,8 @@ def test_route_info_theme_refresh_does_not_call_task_panel_methods():
 
     panel.refresh_theme()
 
-    assert panel._summary.text().startswith("作业线 1")
+    assert panel._summary.text().startswith("预计碾压")
+    assert "作业线 1" in panel._summary.toolTip()
     panel.deleteLater()
     app.processEvents()
 
@@ -147,9 +148,9 @@ def test_route_info_distinguishes_approach_turn_reverse_and_service_segments():
     assert "接近 1" in summary
     assert "倒车 1" in summary
     assert "进出田/卸粮 1" in summary
-    assert "快速查看" in panel._safety.text()
+    assert "快速预览" in panel._safety.text()
     assert "中心线" in panel._safety.text()
-    assert "未就绪" in panel._safety.text()
+    assert "不建议导出" in panel._safety.text()
     assert "支撑<=100" in panel._safety.toolTip()
     assert [row._segment_type for row in panel.findChildren(RouteSegmentRow)] == [
         "work", "turn_approach", "turn", "turn_reverse", "exit"
@@ -304,9 +305,20 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
     assert manifest["application_version"]
     assert manifest["scientific_code"]["fingerprint"]
     assert manifest["source_image"]["sha256"] == "test-source-sha256"
+    assert manifest["output"]["route_classification"] == "research_manual_review"
     assert set(manifest["analysis"]["stage_provenance"]) == {"inference", "mask", "path"}
     assert manifest["integrity"]["config_sha256"]
     assert manifest["integrity"]["route_data_sha256"]
+
+    trial_output = tmp_path / "trial.csv"
+    trial_output.write_text("lon,lat\n120,30\n", encoding="utf-8")
+    path_result["machine_readiness"] = {"controlled_trial_ready": True}
+    trial_manifest_path = window._write_export_manifest(
+        str(trial_output), "CSV", path_result, points
+    )
+    trial_manifest = json.loads(open(trial_manifest_path, "r", encoding="utf-8").read())
+    assert trial_manifest["output"]["route_classification"] == "controlled_field_trial"
+    assert "LOW_SPEED_MANUAL_SUPERVISION" in trial_manifest["output"]["usage_restriction"]
 
 
 def test_machine_parameter_output_is_explicitly_unvalidated_heuristic():

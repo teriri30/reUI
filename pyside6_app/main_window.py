@@ -167,7 +167,7 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "导出 CSV (经纬度)...", "Ctrl+Shift+E", self._on_export_csv_geo)
         self._add_action(fm, "导出 KML...", None, self._on_export_kml)
         self._add_action(fm, "导出 JSON...", None, self._on_export_json)
-        self._add_action(fm, "导出 $PATH（科研兼容）...", None, self._on_export_path_format)
+        self._add_action(fm, "导出收获机路径（$PATH）...", None, self._on_export_path_format)
         self._add_action(fm, "导出快照 PNG...", None, self._on_export_img)
         fm.addSeparator()
         self._add_action(fm, "退出", QKeySequence.Quit, self.close)
@@ -247,6 +247,8 @@ class MainWindow(QMainWindow):
         tp.mask_strength_changed.connect(self._on_mask_strength_changed)
         tp.turn_strategy_changed.connect(self._on_turn_strategy_changed)
         tp.usage_mode_changed.connect(self._on_usage_mode_changed)
+        tp.confirm_no_forbidden_requested.connect(self._on_confirm_no_forbidden)
+        tp.draw_forbidden_requested.connect(self._on_toggle_forbidden_drawing)
         tp.route_edit_requested.connect(self._on_route_edit_requested)
         tp.step_deleted.connect(self._on_step_deleted)
         t = self.top_toolbar
@@ -1381,9 +1383,9 @@ class MainWindow(QMainWindow):
         if getattr(self.state, "auto_path_planned", False):
             self._invalidate_analysis_from("path", "使用模式已变化，必须重新规划和验证")
         labels = {
-            "quick": "快速查看（中心线）",
+            "quick": "快速预览",
             "field_trial": "田间试验（推荐）",
-            "machine_candidate": "严格上机检查",
+            "machine_candidate": "高级校验",
         }
         self.log_panel.info(f"使用模式：{labels.get(usage_mode, usage_mode)}")
 
@@ -1622,6 +1624,26 @@ class MainWindow(QMainWindow):
         self._restore_visual_from_state()
         if self._forbidden_drawing:
             self.log_panel.info("禁行区绘制：点击添加顶点，点击首点闭合；右键取消")
+
+    def _on_confirm_no_forbidden(self):
+        regions = list(getattr(self.state, "forbidden_regions", []) or [])
+        if regions:
+            QMessageBox.information(
+                self,
+                "已有禁行区",
+                f"当前已经绘制 {len(regions)} 处禁行区，无需确认“无禁行区”。",
+            )
+            return
+        if getattr(self.state, "forbidden_regions_confirmed", False):
+            self.log_panel.info("已确认田块内无已知禁行区")
+            return
+        self._save_system_undo("确认无禁行区")
+        had_path = bool(getattr(self.state, "auto_path_planned", False))
+        self.state.safe_update(forbidden_regions_confirmed=True)
+        if had_path:
+            self._invalidate_analysis_from("path", "禁行区确认状态已变化，必须重新规划")
+        self.task_panel.set_forbidden_state(0, True)
+        self.log_panel.success("已确认田块内无已知禁行区")
 
     def _redraw_forbidden_overlay(self, mouse_pos=None):
         self._restore_visual_from_state()
@@ -2461,6 +2483,8 @@ class MainWindow(QMainWindow):
             "cache.py",
             "pyside6_app/workers.py",
         ])
+        readiness = dict(path_result.get("machine_readiness") or {})
+        controlled_trial = bool(readiness.get("controlled_trial_ready", False))
         manifest = {
             "schema": 2,
             "application_version": APP_VERSION,
@@ -2474,9 +2498,15 @@ class MainWindow(QMainWindow):
                 "sha256": self._sha256_file(output_path, use_cache=False),
                 "point_count": len(geo_points),
                 "coordinate_crs": "EPSG:4326",
-                "route_classification": "research_manual_review",
+                "route_classification": (
+                    "controlled_field_trial" if controlled_trial
+                    else "research_manual_review"
+                ),
                 "machine_executable": False,
-                "usage_restriction": "RESEARCH_MANUAL_REVIEW_ONLY",
+                "usage_restriction": (
+                    "CONTROLLED_FIELD_TRIAL_LOW_SPEED_MANUAL_SUPERVISION"
+                    if controlled_trial else "RESEARCH_MANUAL_REVIEW_ONLY"
+                ),
             },
             "source_image": {
                 "path": os.path.abspath(self._tif_path) if self._tif_path else "",
@@ -3434,7 +3464,7 @@ class MainWindow(QMainWindow):
                 path, "GeoJSON", path_result, geo_points
             )
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 GeoJSON: {path}；溯源清单: {manifest}")
+            self.log_panel.success(f"已导出 GeoJSON: {path}；试验记录已保存")
         except Exception as e:
             self._show_geo_export_error("GeoJSON", e)
 
@@ -3448,7 +3478,7 @@ class MainWindow(QMainWindow):
             export_csv(geo_points, path)
             manifest = self._write_export_manifest(path, "CSV", _path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 CSV: {path}；溯源清单: {manifest}")
+            self.log_panel.success(f"已导出 CSV: {path}；试验记录已保存")
         except Exception as e:
             self._show_geo_export_error("CSV", e)
 
@@ -3462,7 +3492,7 @@ class MainWindow(QMainWindow):
             export_kml(geo_points, path)
             manifest = self._write_export_manifest(path, "KML", _path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 KML: {path}；溯源清单: {manifest}")
+            self.log_panel.success(f"已导出 KML: {path}；试验记录已保存")
         except Exception as e:
             self._show_geo_export_error("KML", e)
 
@@ -3476,22 +3506,22 @@ class MainWindow(QMainWindow):
             export_json(geo_points, path_result.get("validation", {}), path)
             manifest = self._write_export_manifest(path, "JSON", path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 JSON: {path}；溯源清单: {manifest}")
+            self.log_panel.success(f"已导出 JSON: {path}；试验记录已保存")
         except Exception as e:
             self._show_geo_export_error("JSON", e)
 
     def _on_export_path_format(self):
         if QMessageBox.warning(
             self,
-            "$PATH 不是已验证的机器执行文件",
-            "当前 $PATH 仅用于科研兼容和人工复核，未经过目标终端协议、车辆运动学和实车跟踪验证。\n\n"
-            "禁止直接用于无人值守农机执行。是否继续导出？",
+            "导出受控田间试验路径",
+            "该路径用于受控田间试验。导入收获机前，请复核影像位置、农机参数、起终点、禁行区和调头方式。\n\n"
+            "首次试跑请低速运行并保持人工看护。是否继续导出？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         ) != QMessageBox.Yes:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出 $PATH", "mission_manual_review_only.path",
+            self, "导出收获机路径", "mission_field_trial.path",
             "PATH (*.path);;Text (*.txt)",
         )
         if not path:
@@ -3502,7 +3532,7 @@ class MainWindow(QMainWindow):
             export_path_format(geo_points, path)
             manifest = self._write_export_manifest(path, "$PATH", _path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 $PATH: {path}；溯源清单: {manifest}")
+            self.log_panel.success(f"已导出收获机路径: {path}；试验记录已保存")
         except Exception as e:
             self._show_geo_export_error("$PATH", e)
 
@@ -4054,6 +4084,10 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("就绪")
     def _refresh_state(self):
         self.top_toolbar.refresh_actions(self.state)
+        self.task_panel.set_forbidden_state(
+            len(getattr(self.state, "forbidden_regions", []) or []),
+            bool(getattr(self.state, "forbidden_regions_confirmed", False)),
+        )
         if (self._pending_segment_display
                 and getattr(self.state, 'inference_done', False)
                 and not getattr(self.state, 'inference_running', True)):

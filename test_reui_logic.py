@@ -106,6 +106,8 @@ def test_confirmed_forbidden_polygon_is_stored_and_invalidates_old_path():
     assert window.state.forbidden_regions == [[(5, 5), (10, 5), (10, 10), (5, 10)]]
     assert window.state.forbidden_regions_confirmed is True
     assert window.state.auto_path_planned is False
+    window._refresh_state()
+    assert "已绘制 1 处" in window.task_panel.forbidden_status_label.text()
 
 
 def test_replacing_field_boundary_invalidates_old_inference_and_forbidden_regions():
