@@ -652,6 +652,7 @@ def validate_footprints(
     )
 
     return {
+        "footprint_model": "simple_track_offset_v1",
         "track_canopy_overlap_pct": track_canopy / track_area * 100.0,
         "track_core_overlap_pct": track_core / track_area * 100.0,
         "rolling_crop_pct": track_core / core_area * 100.0,

@@ -78,6 +78,7 @@ class MainWindow(QMainWindow):
         self._model_list: list = []
         self._build_menu(); self._build_central(); self._build_statusbar()
         self.task_panel.set_mask_strength(self._mask_processing_strength)
+        self.task_panel.set_usage_mode(self._usage_mode_from_config())
         self._connect_signals()
         self.top_toolbar.update_theme_icon(self._theme_mgr.current_theme())
         self._state_timer = QTimer(self)
@@ -245,6 +246,7 @@ class MainWindow(QMainWindow):
         tp.model_changed.connect(self._on_model_combo_changed)
         tp.mask_strength_changed.connect(self._on_mask_strength_changed)
         tp.turn_strategy_changed.connect(self._on_turn_strategy_changed)
+        tp.usage_mode_changed.connect(self._on_usage_mode_changed)
         tp.route_edit_requested.connect(self._on_route_edit_requested)
         tp.step_deleted.connect(self._on_step_deleted)
         t = self.top_toolbar
@@ -691,6 +693,27 @@ class MainWindow(QMainWindow):
                 self._log.info(f"scale calculation failed: {e}")
             basename = os.path.basename(path)
             self.log_panel.success(f"影像加载: {basename} ({full_w}x{full_h})")
+            metadata = dict(result.get("source_metadata") or {})
+            if self.geo.is_ready():
+                try:
+                    center_lon, center_lat = self.geo.pixel_to_lonlat(out_w / 2.0, out_h / 2.0)
+                    gsd_x = self.geo.pixel_distance_m((out_w / 2.0, out_h / 2.0), (out_w / 2.0 + 1.0, out_h / 2.0))
+                    gsd_y = self.geo.pixel_distance_m((out_w / 2.0, out_h / 2.0), (out_w / 2.0, out_h / 2.0 + 1.0))
+                    self.log_panel.info(
+                        f"坐标摘要: {result.get('crs') or '无 CRS'} → EPSG:4326 | "
+                        f"中心 {center_lon:.7f}, {center_lat:.7f} | "
+                        f"预览GSD {gsd_x:.3f}/{gsd_y:.3f} m/px"
+                    )
+                except Exception as exc:
+                    self.log_panel.warn(f"坐标摘要计算失败: {exc}")
+            if int(metadata.get("band_count", 0) or 0) > 3 and metadata.get("rgb_selection_assumed"):
+                indexes = metadata.get("rgb_band_indexes") or [1, 2, 3]
+                QMessageBox.warning(
+                    self,
+                    "请确认 RGB 波段",
+                    "该多波段影像没有明确声明 RGB 色彩解释。\n"
+                    f"当前使用波段 {indexes} 作为 RGB，请确认与模型训练输入一致。",
+                )
             self.lbl_status.setText(f"已加载 {basename}")
             self._journal.info(f"影像加载: {basename}")
             self.task_panel.set_task_status("import_img", "done")
@@ -1306,6 +1329,13 @@ class MainWindow(QMainWindow):
             "very_strong": "强力",
         }
         self._mask_processing_strength = strength_key
+        if strength_key in {"strong", "very_strong"}:
+            QMessageBox.warning(
+                self,
+                "增强补全提示",
+                "增强/强力模式会补全较长的行内断裂，仅适合明显漏检场景。\n\n"
+                "处理后请重点检查田头、道路边缘和面积变化。",
+            )
         config_snapshot = self.cfg.update_section("mask_processing", {"strength": strength_key})
         cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
         save_json_atomic(cfg_path, config_snapshot)
@@ -1317,6 +1347,45 @@ class MainWindow(QMainWindow):
             )
         else:
             self.log_panel.info(f"掩膜处理强度: {labels.get(strength_key, strength_key)}")
+
+    def _usage_mode_from_config(self):
+        planning = self.cfg.section("path_planning")
+        mode = str(planning.get("work_line_mode", "footprint_optimized"))
+        profile = str(planning.get("validation_profile", "field_trial"))
+        if mode == "footprint_optimized" and profile == "machine_candidate":
+            return "machine_candidate"
+        if mode == "footprint_optimized" and profile == "field_trial":
+            return "field_trial"
+        return "quick"
+
+    def _on_usage_mode_changed(self, usage_mode):
+        mapping = {
+            "quick": ("band_centerline", "research"),
+            "field_trial": ("footprint_optimized", "field_trial"),
+            "machine_candidate": ("footprint_optimized", "machine_candidate"),
+        }
+        usage_mode = str(usage_mode or "quick")
+        work_line_mode, validation_profile = mapping.get(usage_mode, mapping["quick"])
+        current = self.cfg.section("path_planning")
+        if (
+            current.get("work_line_mode", "footprint_optimized") == work_line_mode
+            and current.get("validation_profile", "field_trial") == validation_profile
+        ):
+            return
+        snapshot = self.cfg.update_section("path_planning", {
+            "work_line_mode": work_line_mode,
+            "validation_profile": validation_profile,
+        })
+        cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+        save_json_atomic(cfg_path, snapshot)
+        if getattr(self.state, "auto_path_planned", False):
+            self._invalidate_analysis_from("path", "使用模式已变化，必须重新规划和验证")
+        labels = {
+            "quick": "快速查看（中心线）",
+            "field_trial": "田间试验（推荐）",
+            "machine_candidate": "严格上机检查",
+        }
+        self.log_panel.info(f"使用模式：{labels.get(usage_mode, usage_mode)}")
 
     def _on_turn_strategy_changed(self, strategy_key):
         """DECISION-007: a new turn strategy invalidates the planned route."""
@@ -1861,6 +1930,38 @@ class MainWindow(QMainWindow):
         )
         self._pending_segment_display = True
 
+    def _planning_preflight(self, mask_result):
+        usage_mode = self._usage_mode_from_config()
+        if usage_mode == "quick":
+            return True
+        if not getattr(self.state, "forbidden_regions_confirmed", False):
+            answer = QMessageBox.question(
+                self,
+                "确认禁行区",
+                "请确认是否已经检查田块内的沟渠、水坑、电杆等不可通行区域。\n\n"
+                "如果存在，请选择“否”并使用“工具 → 绘制禁行区”；如果确认没有遗漏，请选择“是”。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return False
+            self.state.safe_update(forbidden_regions_confirmed=True)
+        missing = []
+        if len(getattr(self.state, "field_boundary", []) or []) < 3:
+            missing.append("田块边界")
+        if not isinstance(mask_result.get("planning_support_mask"), np.ndarray):
+            missing.append("场地支撑层")
+        if not self.geo.is_ready():
+            missing.append("GeoTIFF 地理坐标")
+        if missing:
+            QMessageBox.warning(
+                self,
+                "规划前检查未通过",
+                "缺少：" + "、".join(missing) + "。\n请补齐后再生成田间试验路径。",
+            )
+            return False
+        return True
+
     def _on_plan(self):
         mask_result = getattr(self.state, 'mask_result', None)
         if mask_result is None:
@@ -1889,6 +1990,9 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             QMessageBox.warning(self, "地理尺度不可用", str(exc))
+            return
+
+        if not self._planning_preflight(mask_result):
             return
 
         self._save_system_undo("路径规划")
@@ -3386,7 +3490,10 @@ class MainWindow(QMainWindow):
             QMessageBox.No,
         ) != QMessageBox.Yes:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "导出 $PATH", "mission.path", "PATH (*.path);;Text (*.txt)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出 $PATH", "mission_manual_review_only.path",
+            "PATH (*.path);;Text (*.txt)",
+        )
         if not path:
             return
         try:

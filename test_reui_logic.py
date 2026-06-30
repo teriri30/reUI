@@ -906,6 +906,52 @@ def test_field_trial_profile_turns_support_metric_into_a_hard_constraint():
     assert any("离开语义支撑区" in issue for issue in result["issues"])
 
 
+def test_candidate_ranking_prefers_lower_semantic_risk_when_both_are_valid():
+    from path_planner import _rank_path_candidates
+
+    base = {
+        "valid": True,
+        "validation_profile": "field_trial",
+        "track_core_overlap_pct": 1.0,
+        "track_outside_field_pct": 0.0,
+        "track_forbidden_overlap_pct": 0.0,
+        "harvest_coverage_pct": 96.0,
+        "total_length_m": 100.0,
+    }
+    safer = dict(base, track_outside_support_pct=0.5, track_uncertain_overlap_pct=1.0)
+    riskier = dict(base, track_outside_support_pct=4.0, track_uncertain_overlap_pct=8.0)
+
+    ranked = _rank_path_candidates([
+        {"strategy": "pear", "validation": riskier, "turn_assessment": {}, "segment_types": []},
+        {"strategy": "bow", "validation": safer, "turn_assessment": {}, "segment_types": []},
+    ])
+
+    assert ranked[0]["strategy"] == "bow"
+    assert ranked[0]["candidate_metrics"]["track_uncertain_overlap_pct"] == 1.0
+
+
+def test_field_trial_preflight_can_explicitly_confirm_no_forbidden_area(monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    window = _window()
+    window.cfg._raw.setdefault("path_planning", {}).update({
+        "work_line_mode": "footprint_optimized",
+        "validation_profile": "field_trial",
+    })
+    window.state.field_boundary = [(0, 0), (19, 0), (19, 19), (0, 19)]
+    window.state.forbidden_regions_confirmed = False
+
+    class Geo:
+        def is_ready(self):
+            return True
+
+    window.geo = Geo()
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args, **_kwargs: QMessageBox.Yes)
+
+    assert window._planning_preflight({"planning_support_mask": np.ones((10, 10), dtype=np.uint8)}) is True
+    assert window.state.forbidden_regions_confirmed is True
+
+
 def test_mask_overlay_draws_headland_and_uncertain_as_separate_layers(monkeypatch):
     """DECISION-009: uncertain residuals must not look like work-body pixels."""
     window = _window()

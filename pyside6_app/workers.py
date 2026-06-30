@@ -150,6 +150,11 @@ class TifLoadWorker(QObject):
                     ],
                     "crs": str(crs) if crs else "",
                     "affine": [float(value) for value in tuple(transform)[:6]],
+                    "rgb_band_indexes": list(preview_preprocessing.get("source_band_indexes", [])),
+                    "rgb_selection_assumed": not all(
+                        name in [str(value).lower() for value in preview_preprocessing.get("source_color_interpretation", [])]
+                        for name in ("red", "green", "blue")
+                    ),
                 }
             if self._cancelled:
                 return
@@ -634,13 +639,19 @@ class PlanWorker(QObject):
             config.setdefault("planning_support_mask", self.mask_result.get("planning_support_mask"))
             config.setdefault("uncertain_mask", self.mask_result.get("uncertain_residual_mask"))
             from footprint_planner import rasterize_forbidden_regions
+            forbidden_confirmed = bool(
+                getattr(self.state, "forbidden_regions_confirmed", False)
+            )
+            forbidden_mask = rasterize_forbidden_regions(processed_mask.shape, self.state)
+            if forbidden_confirmed and forbidden_mask is None:
+                forbidden_mask = np.zeros(processed_mask.shape[:2], dtype=np.uint8)
             config.setdefault(
                 "forbidden_mask",
-                rasterize_forbidden_regions(processed_mask.shape, self.state),
+                forbidden_mask,
             )
             config.setdefault(
                 "forbidden_mask_confirmed",
-                bool(getattr(self.state, "forbidden_regions_confirmed", False)),
+                forbidden_confirmed,
             )
             config["_cancel_callback"] = lambda: self._cancelled
             path_result = plan_path(

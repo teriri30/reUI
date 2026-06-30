@@ -38,6 +38,7 @@
 - `track_outside_support_pct`：履带扫掠离开语义支撑区的比例，不能替代田界指标。
 - `track_uncertain_overlap_pct`：履带扫掠经过未确认残差的比例，仅在提供该图层时有效。
 - `track_forbidden_overlap_pct`：履带扫掠进入人工确认禁行区的比例，仅在提供该图层时有效。
+- `footprint_model=simple_track_offset_v1`：履带中心线偏移和线宽扫掠近似，不包含完整机身、割台前伸或 GNSS 天线姿态包络。
 
 视觉作物端点不得直接冒充物理转弯锚点；新增 `turn_approach` 必须保留在框选田块内并记录校正距离。
 

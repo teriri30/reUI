@@ -1720,7 +1720,7 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
     crossing_count = _count_path_intersections_proper(full_path)
     issues = []
 
-    profile = str(cfg.get("validation_profile", "research"))
+    profile = str(cfg.get("validation_profile", "field_trial"))
     profile_limits = {
         "field_trial": {
             "outside_field": 1.0,
@@ -2219,6 +2219,11 @@ def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
         crossing_penalty = 1200.0 * float(assessment.get("turn_self_crossing_count", 0) or 0)
         core_overlap = float(validation.get("track_core_overlap_pct", 0.0) or 0.0)
         outside = float(validation.get("track_outside_field_pct", 0.0) or 0.0)
+        outside_support = float(validation.get("track_outside_support_pct", 0.0) or 0.0)
+        uncertain_overlap = float(validation.get("track_uncertain_overlap_pct", 0.0) or 0.0)
+        forbidden_overlap = float(validation.get("track_forbidden_overlap_pct", 0.0) or 0.0)
+        profile = str(validation.get("validation_profile", "research"))
+        semantic_weight = 1.0 if profile == "research" else 4.0
         coverage = float(validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct", 0.0)) or 0.0)
         total_length = float(validation.get("total_length_m", 0.0) or 0.0)
         reverse_turns = sum(1 for value in segment_types if str(value).startswith("turn_reverse"))
@@ -2229,6 +2234,9 @@ def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
             + crossing_penalty
             + core_overlap * 80.0
             + outside * 120.0
+            + outside_support * 25.0 * semantic_weight
+            + uncertain_overlap * 15.0 * semantic_weight
+            + forbidden_overlap * 5000.0
             + max(0.0, 95.0 - coverage) * 25.0
             + total_length * 0.08
             + reverse_turns * 8.0
@@ -2240,6 +2248,9 @@ def _rank_path_candidates(candidates: List[Dict]) -> List[Dict]:
             "turn_self_crossing_count": int(assessment.get("turn_self_crossing_count", 0) or 0),
             "track_core_overlap_pct": core_overlap,
             "track_outside_field_pct": outside,
+            "track_outside_support_pct": outside_support,
+            "track_uncertain_overlap_pct": uncertain_overlap,
+            "track_forbidden_overlap_pct": forbidden_overlap,
             "harvest_coverage_pct": coverage,
             "total_length_m": total_length,
             "reverse_turns": reverse_turns,
@@ -2327,7 +2338,7 @@ def _prepare_work_line_layout(
 ) -> Tuple[List[List[Tuple[float, float]]], Dict]:
     """Select the declared work-line generator without silent mode fallback."""
     cfg = dict(config or {})
-    mode = str(cfg.get("work_line_mode", "band_centerline")).strip().lower()
+    mode = str(cfg.get("work_line_mode", "footprint_optimized")).strip().lower()
     if mode == "footprint_optimized":
         work_lines, layout = generate_work_lines(
             processed_mask,

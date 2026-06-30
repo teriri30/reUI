@@ -47,6 +47,14 @@ D:\zhl\anaconda\envs\game\python.exe integrity_check.py path_result.csv.manifest
 - 输出：GeoJSON、CSV、KML、JSON 或 `$PATH`，坐标统一为 WGS84 经度/纬度。
 - 每个正式输出都应与同名 `.manifest.json` 一起归档。
 
+## 使用模式
+
+- `田间试验（推荐）`：默认模式，使用足迹优化和田间试验门限；生成后仍需人工检查影像位置、禁行区和路线。
+- `快速查看（中心线）`：用于论文对照、算法排错和快速预览。
+- `严格上机检查`：在田间试验门限基础上继续检查终端格式、车辆标定和实际轨迹证据。
+
+当前足迹验证采用 `simple_track_offset_v1` 简化模型，即履带中心线偏移与线宽扫掠，不代表完整机身包络。
+
 ## 文档
 
 - [AI 修改规则](AI_RULES.md)

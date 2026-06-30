@@ -27,6 +27,21 @@ def test_machine_readiness_is_fail_closed_without_external_evidence():
     assert readiness["current_route_classification"] == "research_manual_review"
 
 
+def test_controlled_trial_readiness_rejects_coarse_planning_resolution():
+    from machine_route_validator import assess_machine_readiness
+
+    result = _valid_path_result()
+    result["validation"]["footprint_resolution_m"] = 0.2
+    result["planning_factors"] = {"harvester": {"track_width_m": 0.4}}
+    readiness = assess_machine_readiness(
+        result,
+        {"forbidden_mask_confirmed": True},
+    )
+
+    assert readiness["controlled_trial_ready"] is False
+    assert "planning_resolution_too_coarse" in readiness["controlled_trial_blockers"]
+
+
 def test_machine_readiness_accepts_only_complete_verified_evidence():
     from machine_route_validator import assess_machine_readiness
 
@@ -50,6 +65,7 @@ def test_machine_readiness_accepts_only_complete_verified_evidence():
     )
 
     assert readiness["eligible_for_machine_export"] is True
+    assert readiness["controlled_trial_ready"] is True
     assert readiness["blockers"] == []
 
 

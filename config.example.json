@@ -42,8 +42,8 @@
     "turn_radius_m": 1.0
   },
   "path_planning": {
-    "work_line_mode": "band_centerline",
-    "validation_profile": "research",
+    "work_line_mode": "footprint_optimized",
+    "validation_profile": "field_trial",
     "min_turn_radius_m": 1.0,
     "planning_max_dim": 3600,
     "validation_max_dim": 3000,

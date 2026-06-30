@@ -246,6 +246,7 @@ class TaskPanel(QWidget):
     model_changed = Signal(str)
     mask_strength_changed = Signal(str)
     turn_strategy_changed = Signal(str)
+    usage_mode_changed = Signal(str)
     route_edit_requested = Signal()
     step_deleted = Signal(str)
 
@@ -305,6 +306,28 @@ class TaskPanel(QWidget):
                     )
                     rows.append(self.model_combo)
                 if tid == "plan":
+                    usage_label = QLabel("使用模式")
+                    usage_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};padding-left:8px;")
+                    self.usage_mode_combo = QComboBox()
+                    self.usage_mode_combo.setToolTip("快速查看用于论文对照；田间试验启用足迹优化；严格上机检查采用最严格软件门限")
+                    self.usage_mode_combo.setMinimumHeight(30)
+                    self.usage_mode_combo.setStyleSheet(
+                        f"QComboBox{{background:{COLORS['bg_light']};color:{COLORS['text']};"
+                        f"border:1px solid {COLORS['border']};border-radius:4px;padding:4px 8px;font-family:{UI_FONT};}}"
+                    )
+                    for label, key in [
+                        ("快速查看（中心线）", "quick"),
+                        ("田间试验（推荐）", "field_trial"),
+                        ("严格上机检查", "machine_candidate"),
+                    ]:
+                        self.usage_mode_combo.addItem(label, key)
+                    self.usage_mode_combo.currentIndexChanged.connect(
+                        lambda index: self.usage_mode_changed.emit(
+                            str(self.usage_mode_combo.itemData(index) or "quick")
+                        )
+                    )
+                    rows.append(usage_label)
+                    rows.append(self.usage_mode_combo)
                     turn_label = QLabel("调头方式")
                     turn_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};padding-left:8px;")
                     self.turn_combo = QComboBox()
@@ -454,6 +477,15 @@ class TaskPanel(QWidget):
                 self.mask_strength_combo.blockSignals(False)
                 return
 
+    def set_usage_mode(self, key):
+        if not hasattr(self, "usage_mode_combo"):
+            return
+        index = self.usage_mode_combo.findData(str(key or "quick"))
+        if index >= 0:
+            self.usage_mode_combo.blockSignals(True)
+            self.usage_mode_combo.setCurrentIndex(index)
+            self.usage_mode_combo.blockSignals(False)
+
     def set_model_options(self, models, current=""):
         if not hasattr(self, 'model_combo'): return
         self.model_combo.blockSignals(True)
@@ -485,7 +517,7 @@ class TaskPanel(QWidget):
         )
         if hasattr(self, "_mask_strength_label"):
             self._mask_strength_label.setStyleSheet(f"color:{COLORS['text_dim']};font-size:12px;font-family:{UI_FONT};padding-left:8px;")
-        for combo_name in ("model_combo", "turn_combo", "mask_strength_combo"):
+        for combo_name in ("model_combo", "turn_combo", "mask_strength_combo", "usage_mode_combo"):
             combo = getattr(self, combo_name, None)
             if combo:
                 combo.setStyleSheet(combo_style)
@@ -618,17 +650,40 @@ class RouteInfoPanel(QWidget):
         profile = str(validation.get("validation_profile", "research"))
         mode_label = "足迹优化" if mode == "footprint_optimized" else "中心线"
         profile_label = {
-            "research": "科研统计", "field_trial": "受控试验",
-            "machine_candidate": "机器候选",
+            "research": "快速查看", "field_trial": "田间试验",
+            "machine_candidate": "严格上机检查",
         }.get(profile, profile)
         eligible = bool(readiness.get("eligible_for_machine_export", False))
+        trial_ready = bool(readiness.get("controlled_trial_ready", False))
+        execution_label = (
+            "机器候选" if eligible
+            else ("田间试验待人工复核" if trial_ready else "未就绪")
+        )
         self._safety.setText(
             f"路径等级：{profile_label} | {mode_label} | "
-            f"机器执行：{'候选' if eligible else '禁止'}"
+            f"{execution_label}"
         )
         blockers = list(readiness.get("blockers") or [])
+        blocker_labels = {
+            "path_validation_failed": "路径验证未通过",
+            "turn_hard_errors_present": "调头轨迹存在硬错误",
+            "footprint_optimized_work_lines_not_used": "未启用足迹优化",
+            "field_trial_validation_profile_not_used": "未启用田间试验检查",
+            "machine_validation_profile_not_used": "未启用严格上机检查",
+            "confirmed_field_boundary_missing": "田块边界未确认",
+            "semantic_support_missing": "场地支撑层缺失",
+            "confirmed_forbidden_map_missing": "禁行区尚未确认",
+            "planning_resolution_too_coarse": "规划分辨率不足",
+            "external_geo_accuracy_not_verified": "定位精度尚未实测确认",
+            "vehicle_reference_geometry_incomplete": "车辆参考点或天线偏移未标定",
+            "full_vehicle_kinematics_not_validated": "车辆转弯模型尚未实车确认",
+            "terminal_adapter_not_validated": "目标终端格式尚未验证",
+            "field_tracking_validation_missing": "缺少实际轨迹对比",
+            "manual_review_not_signed": "尚未完成人工复核",
+        }
+        readable_blockers = [blocker_labels.get(value, value) for value in blockers]
         limits = validation.get("validation_limits_pct", {}) or {}
-        details = [f"阻断项: {', '.join(blockers)}" if blockers else "机器候选门禁已通过"]
+        details = [f"还需完成: {'；'.join(readable_blockers)}" if blockers else "严格检查已通过"]
         if limits:
             details.append(
                 "阈值(%): 田界<={track_outside_field:g}, 支撑<={track_outside_support:g}, "

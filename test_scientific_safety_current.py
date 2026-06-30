@@ -147,9 +147,9 @@ def test_route_info_distinguishes_approach_turn_reverse_and_service_segments():
     assert "接近 1" in summary
     assert "倒车 1" in summary
     assert "进出田/卸粮 1" in summary
-    assert "科研统计" in panel._safety.text()
+    assert "快速查看" in panel._safety.text()
     assert "中心线" in panel._safety.text()
-    assert "机器执行：禁止" in panel._safety.text()
+    assert "未就绪" in panel._safety.text()
     assert "支撑<=100" in panel._safety.toolTip()
     assert [row._segment_type for row in panel.findChildren(RouteSegmentRow)] == [
         "work", "turn_approach", "turn", "turn_reverse", "exit"

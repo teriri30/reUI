@@ -483,20 +483,24 @@ def load_mask(tif_path: str, suffix: str = "") -> Tuple[Optional[np.ndarray], in
     p = _mask_path(tif_path, suffix)
     if not os.path.exists(p):
         return None, 0, 0
-    data = np.load(p)
-    return data["mask"], int(data["offset_x"]), int(data["offset_y"])
+    with np.load(p, allow_pickle=False) as data:
+        return (
+            np.asarray(data["mask"]).copy(),
+            int(data["offset_x"]),
+            int(data["offset_y"]),
+        )
 
 
 def _load_payload(mask_path: str, cache_dir: str) -> Optional[Dict[str, Any]]:
     try:
-        data = np.load(mask_path)
-        return {
-            "mask": data["mask"],
-            "offset_x": int(data["offset_x"]),
-            "offset_y": int(data["offset_y"]),
-            "meta": _load_meta_from_dir(cache_dir),
-            "cache_dir": cache_dir,
-        }
+        with np.load(mask_path, allow_pickle=False) as data:
+            return {
+                "mask": np.asarray(data["mask"]).copy(),
+                "offset_x": int(data["offset_x"]),
+                "offset_y": int(data["offset_y"]),
+                "meta": _load_meta_from_dir(cache_dir),
+                "cache_dir": cache_dir,
+            }
     except Exception:
         return None
 

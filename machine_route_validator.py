@@ -25,25 +25,37 @@ def assess_machine_readiness(
     validation = dict(result.get("validation") or {})
     layout = dict(result.get("layout") or {})
     turning = dict(result.get("turn_assessment") or {})
-    blockers = []
+    controlled_trial_blockers = []
 
     if not bool(result.get("is_valid", validation.get("valid", False))):
-        blockers.append("path_validation_failed")
+        controlled_trial_blockers.append("path_validation_failed")
     if turning.get("hard_reasons"):
-        blockers.append("turn_hard_errors_present")
+        controlled_trial_blockers.append("turn_hard_errors_present")
     if layout.get("work_line_mode") != "footprint_optimized":
-        blockers.append("footprint_optimized_work_lines_not_used")
-    if validation.get("validation_profile") != "machine_candidate":
-        blockers.append("machine_validation_profile_not_used")
+        controlled_trial_blockers.append("footprint_optimized_work_lines_not_used")
+    if validation.get("validation_profile") not in {"field_trial", "machine_candidate"}:
+        controlled_trial_blockers.append("field_trial_validation_profile_not_used")
     if not bool(validation.get("field_boundary_present")):
-        blockers.append("confirmed_field_boundary_missing")
+        controlled_trial_blockers.append("confirmed_field_boundary_missing")
     if not bool(validation.get("semantic_support_present")):
-        blockers.append("semantic_support_missing")
+        controlled_trial_blockers.append("semantic_support_missing")
     if not (
         bool(validation.get("forbidden_mask_present"))
         and bool(cfg.get("forbidden_mask_confirmed"))
     ):
-        blockers.append("confirmed_forbidden_map_missing")
+        controlled_trial_blockers.append("confirmed_forbidden_map_missing")
+    resolution = validation.get("footprint_resolution_m")
+    harvester = dict((result.get("planning_factors") or {}).get("harvester") or {})
+    track_width = harvester.get("track_width_m")
+    if isinstance(resolution, (int, float)) and isinstance(track_width, (int, float)):
+        resolution_limit = min(0.10, float(track_width) / 4.0)
+        if float(resolution) > resolution_limit:
+            controlled_trial_blockers.append("planning_resolution_too_coarse")
+
+    controlled_trial_blockers = list(dict.fromkeys(controlled_trial_blockers))
+    blockers = list(controlled_trial_blockers)
+    if validation.get("validation_profile") != "machine_candidate":
+        blockers.append("machine_validation_profile_not_used")
 
     geo_report = cfg.get("geo_accuracy_report")
     geo_rmse = geo_report.get("rmse_m") if isinstance(geo_report, dict) else None
@@ -78,6 +90,8 @@ def assess_machine_readiness(
     blockers = list(dict.fromkeys(blockers))
     return {
         "schema": MACHINE_READINESS_SCHEMA,
+        "controlled_trial_ready": not controlled_trial_blockers,
+        "controlled_trial_blockers": controlled_trial_blockers,
         "eligible_for_machine_export": not blockers,
         "current_route_classification": (
             "machine_export_candidate" if not blockers else "research_manual_review"
