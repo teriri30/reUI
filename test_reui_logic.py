@@ -954,6 +954,24 @@ def test_field_trial_preflight_can_explicitly_confirm_no_forbidden_area(monkeypa
     assert window.state.forbidden_regions_confirmed is True
 
 
+def test_confirming_no_forbidden_area_invalidates_existing_path():
+    window = _window()
+    window.state.safe_update(
+        auto_path_planned=True,
+        auto_path_valid=True,
+        auto_path=[[(1.0, 1.0), (10.0, 1.0)]],
+        forbidden_regions=[],
+        forbidden_regions_confirmed=False,
+    )
+
+    window._on_confirm_no_forbidden()
+
+    assert window.state.forbidden_regions_confirmed is True
+    assert window.state.auto_path_planned is False
+    assert window.state.auto_path_valid is False
+    assert window.state.auto_path == []
+
+
 def test_mask_overlay_draws_headland_and_uncertain_as_separate_layers(monkeypatch):
     """DECISION-009: uncertain residuals must not look like work-body pixels."""
     window = _window()

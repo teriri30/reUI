@@ -688,7 +688,7 @@ class RouteInfoPanel(QWidget):
         work = float(validation.get("work_length_m", data.get("work_length_m", 0.0)) or 0.0)
         turn = float(validation.get("turn_length_m", data.get("turn_length_m", 0.0)) or 0.0)
         coverage = validation.get("planned_target_coverage_pct", validation.get("harvest_coverage_pct"))
-        rolling = validation.get("rolling_crop_pct", validation.get("track_core_overlap_pct"))
+        rolling = validation.get("rolling_canopy_pct")
         outside = validation.get("track_outside_field_pct")
         forbidden = validation.get("track_forbidden_overlap_pct")
         efficiency = validation.get("field_efficiency_pct", validation.get("field_efficiency"))
@@ -700,11 +700,17 @@ class RouteInfoPanel(QWidget):
         if efficiency is not None: detail_parts.append(f"效率 {float(efficiency):.1f}%")
         issues = validation.get("issues") or []
         if issues: detail_parts.append(f"风险 {len(issues)}处")
+        if forbidden is None:
+            forbidden_text = "禁行区 未确认"
+        elif abs(float(forbidden)) <= 1e-9:
+            forbidden_text = "禁行区 无侵入"
+        else:
+            forbidden_text = f"禁行区 {float(forbidden):.1f}%"
         main_parts = [
             f"预计碾压 {float(rolling):.1f}%" if rolling is not None else "预计碾压 --",
             f"割台覆盖 {float(coverage):.1f}%" if coverage is not None else "割台覆盖 --",
             f"越界 {float(outside):.1f}%" if outside is not None else "越界 --",
-            f"禁行区 {float(forbidden):.1f}%" if forbidden is not None else "禁行区 未确认",
+            forbidden_text,
             f"总长 {total:.1f}m" if total > 0 else "总长 --",
         ]
         self._summary.setText(" / ".join(main_parts))

@@ -1999,7 +1999,8 @@ def auto_validate_path(full_path: List[List[Tuple[float, float]]],
     )
     description = (
         f"履带核心重叠={metrics['track_core_overlap_pct']:.1f}%, "
-        f"理论碾压={metrics['rolling_crop_pct']:.1f}%, "
+        f"作物主体预计碾压={metrics['rolling_canopy_pct']:.1f}%, "
+        f"作物核心碾压={metrics['rolling_core_pct']:.1f}%, "
         f"割台覆盖={metrics['harvest_coverage_pct']:.1f}%, "
         f"越界={metrics['track_outside_field_pct']:.1f}%"
     )
@@ -2591,7 +2592,8 @@ def plan_path(wide_bands: List[Dict],
 
     description = (
         f"履带核心重叠 {validation['track_core_overlap_pct']:.1f}%, "
-        f"理论碾压 {validation['rolling_crop_pct']:.1f}%, "
+        f"作物主体预计碾压 {validation['rolling_canopy_pct']:.1f}%, "
+        f"作物核心碾压 {validation['rolling_core_pct']:.1f}%, "
         f"规划目标覆盖 {validation['planned_target_coverage_pct']:.1f}%, "
         f"结构化作物覆盖 {validation['harvest_coverage_pct']:.1f}%, "
         f"原始识别作物覆盖 {validation['detected_harvest_coverage_pct']:.1f}%, "

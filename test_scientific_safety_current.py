@@ -113,6 +113,27 @@ def test_route_info_theme_refresh_does_not_call_task_panel_methods():
     app.processEvents()
 
 
+def test_route_info_uses_defined_rolling_metric_and_plain_forbidden_status():
+    from pyside6_app.panels import RouteInfoPanel
+
+    app = QApplication.instance() or QApplication([])
+    panel = RouteInfoPanel()
+    panel.update_route({
+        "validation": {
+            "rolling_canopy_pct": 2.5,
+            "track_core_overlap_pct": 17.0,
+            "track_forbidden_overlap_pct": 0.0,
+        }
+    })
+
+    summary = panel._summary.text()
+    assert "预计碾压 2.5%" in summary
+    assert "17.0%" not in summary
+    assert "禁行区 无侵入" in summary
+    panel.deleteLater()
+    app.processEvents()
+
+
 def test_route_info_distinguishes_approach_turn_reverse_and_service_segments():
     from pyside6_app.panels import RouteInfoPanel, RouteSegmentRow
 

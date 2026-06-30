@@ -163,11 +163,12 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "保存项目", QKeySequence.Save, self._on_save_project)
         self._add_action(fm, "加载模型...", "Ctrl+M", self._on_load_model)
         fm.addSeparator()
-        self._add_action(fm, "导出 GeoJSON...", "Ctrl+E", self._on_export_geojson)
-        self._add_action(fm, "导出 CSV (经纬度)...", "Ctrl+Shift+E", self._on_export_csv_geo)
-        self._add_action(fm, "导出 KML...", None, self._on_export_kml)
-        self._add_action(fm, "导出 JSON...", None, self._on_export_json)
         self._add_action(fm, "导出收获机路径（$PATH）...", None, self._on_export_path_format)
+        record_menu = fm.addMenu("查看与记录导出")
+        self._add_action(record_menu, "导出 GeoJSON...", "Ctrl+E", self._on_export_geojson)
+        self._add_action(record_menu, "导出 CSV (经纬度)...", "Ctrl+Shift+E", self._on_export_csv_geo)
+        self._add_action(record_menu, "导出 KML...", None, self._on_export_kml)
+        self._add_action(record_menu, "导出 JSON...", None, self._on_export_json)
         self._add_action(fm, "导出快照 PNG...", None, self._on_export_img)
         fm.addSeparator()
         self._add_action(fm, "退出", QKeySequence.Quit, self.close)
@@ -2714,7 +2715,7 @@ class MainWindow(QMainWindow):
         total = validation.get("total_length_m")
         turn = validation.get("turn_length_m")
         coverage = validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct"))
-        rolling = validation.get("track_core_overlap_pct", validation.get("rolling_crop_pct"))
+        rolling = validation.get("rolling_canopy_pct")
         parts = [f"[{label}]"]
         if total is not None: parts.append(f"总长 {self._fmt_metric(total)}")
         if turn is not None: parts.append(f"转弯 {self._fmt_metric(turn)}")
@@ -2741,7 +2742,7 @@ class MainWindow(QMainWindow):
         work = validation.get("work_length_m", path_result.get("work_length_m"))
         turn = validation.get("turn_length_m", path_result.get("turn_length_m"))
         coverage = validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct"))
-        rolling = validation.get("track_core_overlap_pct", validation.get("rolling_crop_pct"))
+        rolling = validation.get("rolling_canopy_pct")
         efficiency = validation.get("field_efficiency_pct", validation.get("field_efficiency"))
         if total is not None:
             parts.append(f"总长 {self._fmt_metric(total)}")
@@ -3464,7 +3465,7 @@ class MainWindow(QMainWindow):
                 path, "GeoJSON", path_result, geo_points
             )
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 GeoJSON: {path}；试验记录已保存")
+            self.log_panel.success(f"已导出 GeoJSON：{os.path.basename(path)}；试验记录已保存")
         except Exception as e:
             self._show_geo_export_error("GeoJSON", e)
 
@@ -3478,7 +3479,7 @@ class MainWindow(QMainWindow):
             export_csv(geo_points, path)
             manifest = self._write_export_manifest(path, "CSV", _path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 CSV: {path}；试验记录已保存")
+            self.log_panel.success(f"已导出 CSV：{os.path.basename(path)}；试验记录已保存")
         except Exception as e:
             self._show_geo_export_error("CSV", e)
 
@@ -3492,7 +3493,7 @@ class MainWindow(QMainWindow):
             export_kml(geo_points, path)
             manifest = self._write_export_manifest(path, "KML", _path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 KML: {path}；试验记录已保存")
+            self.log_panel.success(f"已导出 KML：{os.path.basename(path)}；试验记录已保存")
         except Exception as e:
             self._show_geo_export_error("KML", e)
 
@@ -3506,7 +3507,7 @@ class MainWindow(QMainWindow):
             export_json(geo_points, path_result.get("validation", {}), path)
             manifest = self._write_export_manifest(path, "JSON", path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出 JSON: {path}；试验记录已保存")
+            self.log_panel.success(f"已导出 JSON：{os.path.basename(path)}；试验记录已保存")
         except Exception as e:
             self._show_geo_export_error("JSON", e)
 
@@ -3532,7 +3533,9 @@ class MainWindow(QMainWindow):
             export_path_format(geo_points, path)
             manifest = self._write_export_manifest(path, "$PATH", _path_result, geo_points)
             WorkflowUpdater.advance(self.state, "EXPORTED")
-            self.log_panel.success(f"已导出收获机路径: {path}；试验记录已保存")
+            self.log_panel.success(
+                f"已导出收获机路径：{os.path.basename(path)}；试验记录已保存"
+            )
         except Exception as e:
             self._show_geo_export_error("$PATH", e)
 
@@ -3652,7 +3655,7 @@ class MainWindow(QMainWindow):
                 spacings = [float(v * mpp) for v in np.diff(ordered) if v > 0]
         median_spacing = float(np.median(spacings)) if spacings else 0.0
 
-        rolling = float(validation.get("track_core_overlap_pct", validation.get("rolling_crop_pct", 0.0)) or 0.0)
+        track_core_risk = float(validation.get("track_core_overlap_pct", 0.0) or 0.0)
         outside = float(validation.get("track_outside_field_pct", 0.0) or 0.0)
         coverage = float(validation.get("harvest_coverage_pct", validation.get("planned_target_coverage_pct", 0.0)) or 0.0)
         work_len = float(validation.get("work_length_m", path_result.get("work_length_m", 0.0)) or 0.0)
@@ -3664,7 +3667,7 @@ class MainWindow(QMainWindow):
 
         current_track = float(hp.get("track_width_m", 0.45) or 0.45)
         track_candidates = [0.40, 0.45, 0.50, 0.55]
-        if rolling > 8.0:
+        if track_core_risk > 8.0:
             target_track = 0.45 if current_track >= 0.45 else current_track
         elif outside < 1.0 and turn_ratio < 0.28 and coverage >= 90.0:
             target_track = 0.50
@@ -3674,7 +3677,7 @@ class MainWindow(QMainWindow):
 
         current_gauge = float(hp.get("track_gauge_m", 1.7) or 1.7)
         target_gauge = current_gauge
-        if rolling > 8.0 and outside <= 2.0:
+        if track_core_risk > 8.0 and outside <= 2.0:
             target_gauge += 0.10
         elif outside > 2.0:
             target_gauge -= 0.10
@@ -3697,8 +3700,11 @@ class MainWindow(QMainWindow):
         })
 
         reasons = []
-        if rolling > 8.0:
-            reasons.append(f"履带与作物核心重叠 {rolling:.1f}%，优先控制履带宽度并适当调整中心距。")
+        if track_core_risk > 8.0:
+            reasons.append(
+                f"履带与作物核心重叠 {track_core_risk:.1f}%，"
+                "优先控制履带宽度并适当调整中心距。"
+            )
         if outside > 2.0:
             reasons.append(f"履带越界率 {outside:.1f}%，建议更紧凑的轴距/转弯半径并避免过大中心距。")
         if turn_ratio > 0.35:
@@ -3724,7 +3730,7 @@ class MainWindow(QMainWindow):
             "分析依据",
             f"- 调头策略：{self._turn_strategy_label(path_result)}",
             f"- 作业线/正式调头段：{len(path_result.get('tracks', []))} / {len(path_result.get('formal_turns', path_result.get('turns', [])))}",
-            f"- 覆盖率：{coverage:.1f}%，履带重叠：{rolling:.1f}%，履带越界：{outside:.1f}%",
+            f"- 覆盖率：{coverage:.1f}%，履带核心区重叠：{track_core_risk:.1f}%，履带越界：{outside:.1f}%",
             *[f"- {reason}" for reason in reasons],
             "",
             "说明：当前系统没有 DEM、坡度、土壤承载力、重心或侧翻模型。以下结果仅根据影像行带和路径指标生成，不是地形安全结论，也不能替代具体机型技术参数。割台宽度暂沿用当前配置；应用后必须重新生成路径。",
@@ -3773,8 +3779,10 @@ class MainWindow(QMainWindow):
         extra = []
         if "harvest_coverage_pct" in validation:
             extra.append(f"覆盖率: {validation['harvest_coverage_pct']:.1f}%")
+        if "rolling_canopy_pct" in validation:
+            extra.append(f"预计碾压率: {validation['rolling_canopy_pct']:.1f}%")
         if "track_core_overlap_pct" in validation:
-            extra.append(f"碾压率: {validation['track_core_overlap_pct']:.1f}%")
+            extra.append(f"履带核心区重叠: {validation['track_core_overlap_pct']:.1f}%")
         if "field_efficiency" in validation:
             extra.append(f"效率: {validation['field_efficiency']:.1f}%")
         if "crossing_count" in validation:

@@ -39,6 +39,9 @@
 - `track_uncertain_overlap_pct`：履带扫掠经过未确认残差的比例，仅在提供该图层时有效。
 - `track_forbidden_overlap_pct`：履带扫掠进入人工确认禁行区的比例，仅在提供该图层时有效。
 - `footprint_model=simple_track_offset_v1`：履带中心线偏移和线宽扫掠近似，不包含完整机身、割台前伸或 GNSS 天线姿态包络。
+- `rolling_canopy_pct`：履带扫掠与作物主体重叠面积 / 作物主体总面积；作为界面和论文中的“预计碾压率”。
+- `rolling_core_pct`：履带扫掠与作物核心区重叠面积 / 作物核心区总面积；只作为详细风险指标。
+- `track_core_overlap_pct`：履带扫掠中落在作物核心区的面积 / 履带总扫掠面积；用于路径安全门限，不得称为预计碾压率。
 
 视觉作物端点不得直接冒充物理转弯锚点；新增 `turn_approach` 必须保留在框选田块内并记录校正距离。
 
