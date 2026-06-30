@@ -53,6 +53,11 @@ DECISION_ANCHORS = {
         "footprint_planner.py",
         "test_mask_strategy_current.py",
     ),
+    "DECISION-010": (
+        "docs/DECISIONS.md",
+        "path_planner.py",
+        "test_turn_endpoint_current.py",
+    ),
 }
 
 

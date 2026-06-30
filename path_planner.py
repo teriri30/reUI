@@ -16,7 +16,7 @@ from footprint_planner import generate_work_lines, validate_footprints
 from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
 
 
-PATH_PLANNING_VERSION = "footprint-path-v1"
+PATH_PLANNING_VERSION = "footprint-path-v2"
 
 
 def build_band_mask(shape, bands: List[Dict]) -> np.ndarray:
@@ -456,6 +456,12 @@ def _turn_semicircle(start: Tuple[float, float], end: Tuple[float, float],
     )
     if distance < 2.0 or lateral is None:
         return [start, end]
+    physical_radius_m = distance * max(mpp, 1e-6) * 0.5
+    if physical_radius_m < float(min_radius_m) - 1e-6:
+        raise ValueError(
+            f"semicircle radius {physical_radius_m:.3f} m is below the "
+            f"minimum turn radius {float(min_radius_m):.3f} m"
+        )
     clearance = _turn_clearance_px(clearance_m, mpp)
     start_out = start_v + outward * clearance
     end_out = end_v + outward * clearance
@@ -626,7 +632,7 @@ def _turn_fishtail(start: Tuple[float, float], end: Tuple[float, float],
         mpp,
         min_radius_m,
         clearance_m,
-        inner=True,
+        inner=False,
     )
     points = []
     for segment, _ in segments:
@@ -923,6 +929,28 @@ def _select_turn_strategy(
     fallback_from = None
     fallback_reason = ""
 
+    # DECISION-010: omega/2 below R is never an executable semicircle.
+    if (
+        spacing < two_radius - 1e-6
+        and requested in {"auto", "bow", "semicircle"}
+    ):
+        strategy = "fishtail" if headland_limited else "pear"
+        fallback_from = None if requested == "auto" else requested
+        fallback_reason = (
+            f"omega={spacing:.2f}m gives omega/2={spacing * 0.5:.2f}m "
+            f"below R={radius:.2f}m; using {TURN_STRATEGY_LABELS[strategy]} "
+            "instead of a subminimum-radius semicircle"
+        )
+        return {
+            "requested_strategy": requested,
+            "strategy": strategy,
+            "reason": fallback_reason,
+            "fallback_from": fallback_from,
+            "fallback_reason": fallback_reason if fallback_from else "",
+            "pass_spacing_m": spacing,
+            "turn_radius_m": radius,
+        }
+
     if requested == "auto":
         if spacing < two_radius - tolerance:
             strategy = "semicircle"
@@ -1189,6 +1217,107 @@ def _harvester_specs(state=None) -> Dict[str, float]:
     }
 
 
+def _align_short_turn_anchors(
+    work_lines: List[List[Tuple[float, float]]],
+    main_angle: float,
+    mpp: float,
+    field_polygon: Optional[np.ndarray],
+    config: Optional[Dict] = None,
+) -> Tuple[List[Dict[str, Tuple[float, float]]], Dict]:
+    """Build turn anchors without changing crop-evidence work segments.
+
+    DECISION-010 only aligns a statistically short line to the cohort endpoint
+    median. The extra distance is emitted later as a non-work turn approach,
+    and correction is refused without a verified in-field segment.
+    """
+    cfg = dict(config or {})
+    anchors = [
+        {
+            "start": (float(line[0][0]), float(line[0][1])),
+            "end": (float(line[-1][0]), float(line[-1][1])),
+        }
+        for line in work_lines
+    ]
+    diagnostics = {
+        "enabled": True,
+        "corrected_endpoint_count": 0,
+        "blocked_endpoint_count": 0,
+        "corrections": [],
+        "blocked": [],
+    }
+    if len(work_lines) < 3:
+        diagnostics["reason"] = "fewer_than_three_lines"
+        return anchors, diagnostics
+
+    direction = np.asarray(
+        (math.cos(float(main_angle)), math.sin(float(main_angle))),
+        dtype=np.float64,
+    )
+    endpoint_projections = []
+    spans = []
+    for line in work_lines:
+        first = float(np.dot(np.asarray(line[0], dtype=np.float64), direction))
+        last = float(np.dot(np.asarray(line[-1], dtype=np.float64), direction))
+        endpoint_projections.append((first, last))
+        spans.append(abs(last - first))
+    median_span_px = float(np.median(spans))
+    target_low = float(np.median([min(values) for values in endpoint_projections]))
+    target_high = float(np.median([max(values) for values in endpoint_projections]))
+    diagnostics["median_span_m"] = median_span_px * mpp
+    diagnostics["target_projection_m"] = [target_low * mpp, target_high * mpp]
+
+    short_ratio = float(cfg.get("endpoint_short_line_ratio", 0.85))
+    min_shortfall_m = float(cfg.get("endpoint_shortfall_min_m", 0.50))
+    max_extension_m = float(cfg.get("endpoint_extension_max_m", 4.0))
+    for line_index, (line, projections, span_px) in enumerate(
+        zip(work_lines, endpoint_projections, spans)
+    ):
+        if median_span_px <= 1e-9 or span_px >= median_span_px * short_ratio:
+            continue
+        midpoint = 0.5 * (projections[0] + projections[1])
+        for endpoint_name, point, projection in (
+            ("start", line[0], projections[0]),
+            ("end", line[-1], projections[1]),
+        ):
+            low_side = projection <= midpoint
+            target_projection = target_low if low_side else target_high
+            delta_px = target_projection - projection
+            outward = delta_px < -1e-9 if low_side else delta_px > 1e-9
+            extension_m = abs(delta_px) * mpp
+            if not outward or extension_m < min_shortfall_m:
+                continue
+            target = (
+                float(point[0] + direction[0] * delta_px),
+                float(point[1] + direction[1] * delta_px),
+            )
+            blocked_reason = ""
+            if extension_m > max_extension_m:
+                blocked_reason = "extension_limit"
+            elif field_polygon is None:
+                blocked_reason = "missing_field_boundary"
+            elif not _segment_inside_field_boundary([point, target], field_polygon):
+                blocked_reason = "outside_field_boundary"
+            if blocked_reason:
+                diagnostics["blocked_endpoint_count"] += 1
+                diagnostics["blocked"].append({
+                    "line_index": line_index,
+                    "endpoint": endpoint_name,
+                    "extension_m": extension_m,
+                    "reason": blocked_reason,
+                })
+                continue
+            anchors[line_index][endpoint_name] = target
+            diagnostics["corrected_endpoint_count"] += 1
+            diagnostics["corrections"].append({
+                "line_index": line_index,
+                "endpoint": endpoint_name,
+                "extension_m": extension_m,
+                "crop_endpoint": [float(point[0]), float(point[1])],
+                "turn_anchor": [target[0], target[1]],
+            })
+    return anchors, diagnostics
+
+
 def _connect_work_lines(
         work_lines: List[List[Tuple[float, float]]],
         geo=None,
@@ -1283,9 +1412,25 @@ def _connect_work_lines(
     segment_types = []
     pass_spacings_m = []
     used_strategies = []
+    turn_decisions = []
     fallback_reasons = []
     boundary_adjustments = []
+    boundary_hard_reasons = []
     field_polygon = _field_boundary_local_polygon(state)
+    turn_anchors, endpoint_alignment = _align_short_turn_anchors(
+        oriented,
+        main_angle=(
+            math.atan2(
+                oriented[0][-1][1] - oriented[0][0][1],
+                oriented[0][-1][0] - oriented[0][0][0],
+            )
+            if oriented and len(oriented[0]) >= 2
+            else 0.0
+        ),
+        mpp=mpp,
+        field_polygon=field_polygon,
+        config=cfg,
+    )
 
     if entry_point and oriented:
         full_path.append([entry_point, oriented[0][0]])
@@ -1296,8 +1441,11 @@ def _connect_work_lines(
         if index >= len(oriented) - 1:
             continue
         next_line = oriented[index + 1]
-        start = line[-1]
-        end = next_line[0]
+        start = turn_anchors[index]["end"]
+        end = turn_anchors[index + 1]["start"]
+        if math.hypot(start[0] - line[-1][0], start[1] - line[-1][1]) > 1e-7:
+            full_path.append([line[-1], start])
+            segment_types.append("turn_approach")
         direction_x = start[0] - line[-2][0]
         direction_y = start[1] - line[-2][1]
         direction_norm = math.hypot(direction_x, direction_y)
@@ -1312,7 +1460,11 @@ def _connect_work_lines(
         lateral_y = end[1] - start[1]
         cross = work_direction[0] * lateral_y - work_direction[1] * lateral_x
         turn_sign = 1.0 if cross >= 0 else -1.0
-        gap_m = math.hypot(end[0] - start[0], end[1] - start[1]) * mpp
+        gap_m = abs(
+            work_direction[0] * lateral_y - work_direction[1] * lateral_x
+        ) * mpp
+        if gap_m <= 1e-9:
+            gap_m = math.hypot(lateral_x, lateral_y) * mpp
         pass_spacings_m.append(gap_m)
         decision = _select_turn_strategy(
             requested_strategy,
@@ -1320,6 +1472,19 @@ def _connect_work_lines(
             min_turn_radius_m,
         )
         selected_strategy = decision["strategy"]
+        turn_decisions.append({
+            "transition_index": index,
+            "requested_strategy": decision.get("requested_strategy"),
+            "strategy": selected_strategy,
+            "pass_spacing_m": float(gap_m),
+            "turn_radius_m": float(min_turn_radius_m),
+            "reason": decision.get("reason", ""),
+            "fallback_reason": decision.get("fallback_reason", ""),
+            "crop_exit": [float(line[-1][0]), float(line[-1][1])],
+            "turn_start": [float(start[0]), float(start[1])],
+            "turn_end": [float(end[0]), float(end[1])],
+            "crop_entry": [float(next_line[0][0]), float(next_line[0][1])],
+        })
         if decision.get("fallback_reason"):
             fallback_reasons.append(decision["fallback_reason"])
         used_strategies.append(selected_strategy)
@@ -1332,7 +1497,7 @@ def _connect_work_lines(
                 mpp,
                 min_turn_radius_m,
                 clearance_m,
-                inner=True,
+                inner=(selected_strategy == "alpha"),
             )
             for turn_part, turn_type in turn_parts:
                 full_path.append(turn_part)
@@ -1351,8 +1516,19 @@ def _connect_work_lines(
             )
             if boundary_reason:
                 boundary_adjustments.append(boundary_reason)
+                if len(turn) <= 2:
+                    boundary_hard_reasons.append(
+                        "turn geometry degraded to a straight segment because no "
+                        "kinematically valid curve fit inside the field boundary"
+                    )
             full_path.append(turn)
             segment_types.append("turn")
+        if math.hypot(
+            end[0] - next_line[0][0],
+            end[1] - next_line[0][1],
+        ) > 1e-7:
+            full_path.append([end, next_line[0]])
+            segment_types.append("turn_approach")
 
     if exit_point and oriented:
         route_end = oriented[-1][-1]
@@ -1383,6 +1559,10 @@ def _connect_work_lines(
         pass_spacings_m,
         min_turn_radius_m,
     )
+    if boundary_hard_reasons:
+        assessment.setdefault("hard_reasons", []).extend(boundary_hard_reasons)
+        assessment["feasible"] = False
+        assessment["needs_confirmation"] = True
     diagnostics = {
         **assessment,
         "requested_strategy": requested_strategy,
@@ -1394,6 +1574,8 @@ def _connect_work_lines(
             "adjustment_reasons": boundary_adjustments,
         },
         "pass_spacings_m": pass_spacings_m,
+        "turn_decisions": turn_decisions,
+        "endpoint_alignment": endpoint_alignment,
         "service_points": {
             "entry_present": entry_point is not None,
             "exit_present": exit_point is not None,
@@ -2181,6 +2363,12 @@ def plan_path(wide_bands: List[Dict],
             config=cfg,
             return_diagnostics=True,
         )
+        candidate_assessment["user_requested_strategy"] = turn_strategy
+        for decision in candidate_assessment.get("turn_decisions", []) or []:
+            decision["user_requested_strategy"] = turn_strategy
+            decision["candidate_strategy"] = strategy_key
+            if turn_strategy == "auto" and decision.get("reason") == "用户指定":
+                decision["reason"] = "自动多策略评估中的候选策略满足该处几何约束"
         abort_if_cancelled()
         candidate_validation = validate_path(
             candidate_segments,
@@ -2217,6 +2405,16 @@ def plan_path(wide_bands: List[Dict],
             )
         candidate_assessment["feasible"] = not candidate_assessment.get("hard_reasons")
         candidate_assessment["needs_confirmation"] = bool(candidate_assessment.get("hard_reasons"))
+        if candidate_assessment.get("hard_reasons"):
+            candidate_validation = dict(candidate_validation)
+            candidate_validation["valid"] = False
+            issues = list(candidate_validation.get("issues") or [])
+            issues.extend(
+                f"转弯运动学不可行: {reason}"
+                for reason in candidate_assessment["hard_reasons"]
+                if f"转弯运动学不可行: {reason}" not in issues
+            )
+            candidate_validation["issues"] = issues
         return {
             "strategy": strategy_key,
             "path_segments": candidate_segments,
@@ -2237,9 +2435,25 @@ def plan_path(wide_bands: List[Dict],
     validation = selected_candidate["validation"]
     turn_assessment = selected_candidate["turn_assessment"]
     turn_assessment["selected_candidate_strategy"] = selected_candidate.get("strategy")
+    turn_assessment["user_requested_strategy"] = turn_strategy
     turn_assessment["candidate_score"] = selected_candidate.get("candidate_score")
     turn_assessment["candidate_metrics"] = selected_candidate.get("candidate_metrics", {})
     turn_assessment["candidate_count"] = len(ranked_candidates)
+    endpoint_alignment = turn_assessment.get("endpoint_alignment", {}) or {}
+    if endpoint_alignment.get("corrected_endpoint_count", 0):
+        log.info(
+            "异常短作业线端点校正: "
+            f"已校正 {endpoint_alignment.get('corrected_endpoint_count', 0)} 个端点, "
+            f"阻止 {endpoint_alignment.get('blocked_endpoint_count', 0)} 个端点"
+        )
+    for decision in turn_assessment.get("turn_decisions", []) or []:
+        log.info(
+            f"转弯 {int(decision.get('transition_index', 0)) + 1}: "
+            f"ω={float(decision.get('pass_spacing_m', 0.0)):.2f}m, "
+            f"R={float(decision.get('turn_radius_m', 0.0)):.2f}m, "
+            f"策略={TURN_STRATEGY_LABELS.get(str(decision.get('strategy', '')), decision.get('strategy', ''))}, "
+            f"原因={decision.get('reason', '')}"
+        )
 
     description = (
         f"履带核心重叠 {validation['track_core_overlap_pct']:.1f}%, "

@@ -592,7 +592,7 @@ def test_manual_bow_falls_back_when_spacing_is_less_than_two_radius():
     )
 
     assert "turn" in segment_types
-    assert diagnostics["used_strategies"] == ["semicircle"]
+    assert diagnostics["used_strategies"] == ["pear"]
     assert diagnostics["requested_strategy"] == "bow"
 
 
@@ -621,7 +621,7 @@ def test_bow_fallback_removes_requested_bow_hard_error():
         return_diagnostics=True,
     )
 
-    assert diagnostics["used_strategies"] == ["semicircle"]
+    assert diagnostics["used_strategies"] == ["pear"]
     assert diagnostics["fallback_reasons"]
     assert not any("弓形转弯" in reason for reason in diagnostics["hard_reasons"])
 
@@ -631,9 +631,9 @@ def test_turn_strategy_selector_matrix():
 
     assert _select_turn_strategy("auto", 5.0, 2.0)["strategy"] == "bow"
     assert _select_turn_strategy("auto", 4.02, 2.0)["strategy"] == "semicircle"
-    assert _select_turn_strategy("auto", 3.0, 2.0)["strategy"] == "semicircle"
+    assert _select_turn_strategy("auto", 3.0, 2.0)["strategy"] == "pear"
     decision = _select_turn_strategy("bow", 3.0, 2.0)
-    assert decision["strategy"] == "semicircle"
+    assert decision["strategy"] == "pear"
     assert decision["fallback_from"] == "bow"
 
 

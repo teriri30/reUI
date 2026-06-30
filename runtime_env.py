@@ -15,6 +15,7 @@ def configure_geospatial_environment() -> dict:
         "PROJ_DATA": [
             os.path.join(prefix, "Library", "share", "proj"),
             os.path.join(prefix, "share", "proj"),
+            os.path.join(prefix, "Lib", "site-packages", "rasterio", "proj_data"),
             os.path.join(prefix, "Lib", "site-packages", "pyproj", "proj_dir", "share", "proj"),
         ],
     }

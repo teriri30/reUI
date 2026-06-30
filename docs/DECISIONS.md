@@ -156,6 +156,26 @@
 
 **允许的变更方式**：可通过真实标注样本调整米制邻近阈值和端部阈值，但必须同时报告主体误增面积、主体漏保留面积、田头误分类面积和运行时间。
 
+## DECISION-010：转弯锚点和曲率约束必须物理可解释
+
+**结论**：作物中心线端点是识别证据，不必然是转弯起点。只有单条作业线显著短于同组中位长度、补偿距离受限且补偿段完全位于田块内时，才允许建立独立 `turn_approach`。任何半圆半径不得小于农机最小转弯半径。
+
+**原因**：单行识别残缺会让蛇形连接在某一处提前转弯；而以 `ω/2 < R` 的半圆强行连接虽然视觉连续，真实农机无法执行。边界内直线连接也不能替代满足曲率约束的转弯。
+
+**不变量**：
+
+- 原 `work` 段保持作物证据范围，端点补偿单独标记为 `turn_approach`。
+- 少于三条作业线、没有田块边界、补偿超限或补偿段越界时禁止自动校正。
+- `ω < 2R` 时禁止选择或生成普通半圆，前进模式使用满足半径的梨形，受限场景使用明确含倒车动作的策略。
+- 转弯曲线退化为端点直线时必须产生运动学硬错误，并使候选路径验证失败。
+- 端点校正数量、补偿距离、阻止原因、实际策略、`ω` 和 `R` 必须进入规划诊断。
+
+**代码锚点**：`path_planner._align_short_turn_anchors`、`path_planner._select_turn_strategy`、`path_planner._turn_semicircle`、`path_planner._connect_work_lines`。
+
+**测试锚点**：`test_single_short_line_uses_separate_headland_approach_before_turn`、`test_endpoint_alignment_refuses_target_outside_field_boundary`、`test_spacing_below_two_radius_never_selects_semicircle`、`test_boundary_direct_fallback_is_reported_as_kinematic_failure`。
+
+**允许的变更方式**：阈值只能依据带人工核验端点的真实样本调整；至少报告提前转弯检出率、误校正率、最小曲率、越界率和路线覆盖率。
+
 ## 修改决策的方式
 
 决策不是永久禁止演进。需要改变时，必须在同一个变更中：

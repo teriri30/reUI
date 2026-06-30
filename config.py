@@ -54,6 +54,9 @@ def validate_config(raw: dict) -> dict:
     _validated_number(planning, "min_turn_radius_m", minimum=0.0, strict_min=True)
     _validated_number(planning, "planning_max_dim", minimum=256)
     _validated_number(planning, "validation_max_dim", minimum=256)
+    _validated_number(planning, "endpoint_short_line_ratio", minimum=0.5, maximum=1.0)
+    _validated_number(planning, "endpoint_shortfall_min_m", minimum=0.0)
+    _validated_number(planning, "endpoint_extension_max_m", minimum=0.0)
     for key in (
         "max_track_core_overlap_pct", "min_harvest_coverage_pct",
         "max_track_outside_field_pct",
