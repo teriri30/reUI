@@ -54,7 +54,7 @@ def test_config_defaults_match_model_defaults_when_config_file_is_missing():
 
 
 def test_config_json_model_defaults_match_code_defaults():
-    config_path = Path(__file__).with_name("config.json")
+    config_path = Path(__file__).with_name("config.example.json")
     config = json.loads(config_path.read_text(encoding="utf-8"))
     model_config = config["model"]
 

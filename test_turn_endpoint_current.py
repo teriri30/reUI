@@ -100,6 +100,37 @@ def test_endpoint_alignment_refuses_target_outside_field_boundary():
     assert diagnostics["endpoint_alignment"]["blocked_endpoint_count"] >= 1
 
 
+def test_single_endpoint_shortfall_is_detected_when_total_line_is_not_short():
+    """One early endpoint must not be hidden by a normal/long opposite end."""
+    from path_planner import _connect_work_lines
+
+    lines = [
+        [(10.0, 20.0), (100.0, 20.0)],
+        [(0.0, 40.0), (80.0, 40.0)],
+        [(10.0, 60.0), (100.0, 60.0)],
+    ]
+    _path, _types, diagnostics = _connect_work_lines(
+        lines,
+        geo=MetricGeo(),
+        state=FieldState(),
+        min_turn_radius_m=2.0,
+        turn_strategy="pear",
+        config={
+            "endpoint_short_line_ratio": 0.85,
+            "endpoint_shortfall_min_m": 0.5,
+            "endpoint_extension_max_m": 4.0,
+            "endpoint_outlier_mad_scale": 3.0,
+        },
+        return_diagnostics=True,
+        global_main_angle=0.0,
+    )
+
+    alignment = diagnostics["endpoint_alignment"]
+    assert alignment["corrected_endpoint_count"] == 1
+    assert alignment["corrections"][0]["extension_m"] == pytest.approx(2.0)
+    assert alignment["direction_source"] == "global_main_angle"
+
+
 def test_spacing_below_two_radius_never_selects_semicircle():
     """DECISION-010: omega/2 below R cannot produce an executable semicircle."""
     from path_planner import _select_turn_strategy

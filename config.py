@@ -51,15 +51,23 @@ def validate_config(raw: dict) -> dict:
             raise ConfigValidationError("track_width_m must be smaller than track_gauge_m")
 
     planning = raw.get("path_planning", {})
+    if "work_line_mode" in planning and str(planning["work_line_mode"]) not in {
+        "band_centerline", "footprint_optimized",
+    }:
+        raise ConfigValidationError(
+            "work_line_mode must be band_centerline or footprint_optimized"
+        )
     _validated_number(planning, "min_turn_radius_m", minimum=0.0, strict_min=True)
     _validated_number(planning, "planning_max_dim", minimum=256)
     _validated_number(planning, "validation_max_dim", minimum=256)
     _validated_number(planning, "endpoint_short_line_ratio", minimum=0.5, maximum=1.0)
     _validated_number(planning, "endpoint_shortfall_min_m", minimum=0.0)
     _validated_number(planning, "endpoint_extension_max_m", minimum=0.0)
+    _validated_number(planning, "endpoint_outlier_mad_scale", minimum=0.0)
     for key in (
         "max_track_core_overlap_pct", "min_harvest_coverage_pct",
-        "max_track_outside_field_pct",
+        "max_track_outside_field_pct", "max_track_outside_support_pct",
+        "max_track_uncertain_overlap_pct", "max_track_forbidden_overlap_pct",
     ):
         _validated_number(planning, key, minimum=0.0, maximum=100.0)
 

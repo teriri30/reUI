@@ -158,7 +158,7 @@
 
 ## DECISION-010：转弯锚点和曲率约束必须物理可解释
 
-**结论**：作物中心线端点是识别证据，不必然是转弯起点。只有单条作业线显著短于同组中位长度、补偿距离受限且补偿段完全位于田块内时，才允许建立独立 `turn_approach`。任何半圆半径不得小于农机最小转弯半径。
+**结论**：作物中心线端点是识别证据，不必然是转弯起点。端点必须按同侧端点分布独立判断；补偿距离受限且补偿段完全位于田块内时，才允许建立独立 `turn_approach`。任何半圆半径不得小于农机最小转弯半径。
 
 **原因**：单行识别残缺会让蛇形连接在某一处提前转弯；而以 `ω/2 < R` 的半圆强行连接虽然视觉连续，真实农机无法执行。边界内直线连接也不能替代满足曲率约束的转弯。
 
@@ -175,6 +175,19 @@
 **测试锚点**：`test_single_short_line_uses_separate_headland_approach_before_turn`、`test_endpoint_alignment_refuses_target_outside_field_boundary`、`test_spacing_below_two_radius_never_selects_semicircle`、`test_boundary_direct_fallback_is_reported_as_kinematic_failure`。
 
 **允许的变更方式**：阈值只能依据带人工核验端点的真实样本调整；至少报告提前转弯检出率、误校正率、最小曲率、越界率和路线覆盖率。
+
+## DECISION-011：作业线模式、语义足迹与机器执行门禁
+
+**结论**：田块硬边界、语义支撑区、不确定区和人工确认禁行区必须分别统计，不得互相替代。通用地理导出不是机器执行协议。
+
+**不变量**：
+
+- `work_line_mode=band_centerline` 保持现有论文流程；`footprint_optimized` 显式启用足迹代价驱动作业线，失败时不得静默回退。
+- 未确认的不确定残差不得自动升级为禁行区；提供禁行区时，履带重叠默认硬门限为 0%。
+- GeoJSON、CSV、KML、JSON 和 `$PATH` 标记为科研/人工复核导出，不得宣称为机器可执行路线。
+- 缺少外部定位精度、车辆参考几何、完整运动学、终端适配、实车跟踪验证或人工签署时，机器执行就绪评估必须失败关闭。
+
+**代码锚点**：`path_planner._prepare_work_line_layout`、`footprint_planner.validate_footprints`、`machine_route_validator.assess_machine_readiness`、`RouteInfoPanel`。
 
 ## 修改决策的方式
 

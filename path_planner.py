@@ -16,7 +16,7 @@ from footprint_planner import generate_work_lines, validate_footprints
 from row_geometry import field_polygon_local, meters_per_pixel, smooth_1d
 
 
-PATH_PLANNING_VERSION = "footprint-path-v2"
+PATH_PLANNING_VERSION = "footprint-path-v3"
 
 
 def build_band_mask(shape, bands: List[Dict]) -> np.ndarray:
@@ -1226,9 +1226,9 @@ def _align_short_turn_anchors(
 ) -> Tuple[List[Dict[str, Tuple[float, float]]], Dict]:
     """Build turn anchors without changing crop-evidence work segments.
 
-    DECISION-010 only aligns a statistically short line to the cohort endpoint
-    median. The extra distance is emitted later as a non-work turn approach,
-    and correction is refused without a verified in-field segment.
+    DECISION-011 evaluates each endpoint independently against the cohort.
+    The extra distance is emitted later as a non-work turn approach, and
+    correction is refused without a verified in-field segment.
     """
     cfg = dict(config or {})
     anchors = [
@@ -1254,26 +1254,37 @@ def _align_short_turn_anchors(
         dtype=np.float64,
     )
     endpoint_projections = []
-    spans = []
     for line in work_lines:
         first = float(np.dot(np.asarray(line[0], dtype=np.float64), direction))
         last = float(np.dot(np.asarray(line[-1], dtype=np.float64), direction))
         endpoint_projections.append((first, last))
-        spans.append(abs(last - first))
+    low_values = np.asarray(
+        [min(values) for values in endpoint_projections], dtype=np.float64
+    )
+    high_values = np.asarray(
+        [max(values) for values in endpoint_projections], dtype=np.float64
+    )
+    spans = high_values - low_values
     median_span_px = float(np.median(spans))
-    target_low = float(np.median([min(values) for values in endpoint_projections]))
-    target_high = float(np.median([max(values) for values in endpoint_projections]))
+    target_low = float(np.median(low_values))
+    target_high = float(np.median(high_values))
+    low_mad_px = float(np.median(np.abs(low_values - target_low)))
+    high_mad_px = float(np.median(np.abs(high_values - target_high)))
     diagnostics["median_span_m"] = median_span_px * mpp
     diagnostics["target_projection_m"] = [target_low * mpp, target_high * mpp]
+    diagnostics["direction_rad"] = float(main_angle)
 
-    short_ratio = float(cfg.get("endpoint_short_line_ratio", 0.85))
     min_shortfall_m = float(cfg.get("endpoint_shortfall_min_m", 0.50))
     max_extension_m = float(cfg.get("endpoint_extension_max_m", 4.0))
-    for line_index, (line, projections, span_px) in enumerate(
-        zip(work_lines, endpoint_projections, spans)
+    mad_scale = float(cfg.get("endpoint_outlier_mad_scale", 3.0))
+    side_thresholds_m = {
+        "low": max(min_shortfall_m, 1.4826 * low_mad_px * mpp * mad_scale),
+        "high": max(min_shortfall_m, 1.4826 * high_mad_px * mpp * mad_scale),
+    }
+    diagnostics["outlier_threshold_m"] = dict(side_thresholds_m)
+    for line_index, (line, projections) in enumerate(
+        zip(work_lines, endpoint_projections)
     ):
-        if median_span_px <= 1e-9 or span_px >= median_span_px * short_ratio:
-            continue
         midpoint = 0.5 * (projections[0] + projections[1])
         for endpoint_name, point, projection in (
             ("start", line[0], projections[0]),
@@ -1284,7 +1295,9 @@ def _align_short_turn_anchors(
             delta_px = target_projection - projection
             outward = delta_px < -1e-9 if low_side else delta_px > 1e-9
             extension_m = abs(delta_px) * mpp
-            if not outward or extension_m < min_shortfall_m:
+            side = "low" if low_side else "high"
+            outlier_threshold_m = side_thresholds_m[side]
+            if not outward or extension_m < outlier_threshold_m:
                 continue
             target = (
                 float(point[0] + direction[0] * delta_px),
@@ -1303,6 +1316,7 @@ def _align_short_turn_anchors(
                     "line_index": line_index,
                     "endpoint": endpoint_name,
                     "extension_m": extension_m,
+                    "outlier_threshold_m": outlier_threshold_m,
                     "reason": blocked_reason,
                 })
                 continue
@@ -1312,6 +1326,8 @@ def _align_short_turn_anchors(
                 "line_index": line_index,
                 "endpoint": endpoint_name,
                 "extension_m": extension_m,
+                "outlier_threshold_m": outlier_threshold_m,
+                "side": side,
                 "crop_endpoint": [float(point[0]), float(point[1])],
                 "turn_anchor": [target[0], target[1]],
             })
@@ -1326,6 +1342,7 @@ def _connect_work_lines(
         turn_strategy: str = "bow",
         config: Optional[Dict] = None,
         return_diagnostics: bool = False,
+        global_main_angle: Optional[float] = None,
 ):
     """Connect ordered coverage passes with direction-aware headland turns."""
     if not work_lines:
@@ -1417,20 +1434,32 @@ def _connect_work_lines(
     boundary_adjustments = []
     boundary_hard_reasons = []
     field_polygon = _field_boundary_local_polygon(state)
+    alignment_angle = global_main_angle
+    alignment_direction_source = "global_main_angle"
+    if alignment_angle is None or not math.isfinite(float(alignment_angle)):
+        weighted_cos = 0.0
+        weighted_sin = 0.0
+        for line in oriented:
+            if len(line) < 2:
+                continue
+            dx = float(line[-1][0] - line[0][0])
+            dy = float(line[-1][1] - line[0][1])
+            weight = math.hypot(dx, dy)
+            if weight <= 1e-9:
+                continue
+            angle = math.atan2(dy, dx)
+            weighted_cos += weight * math.cos(2.0 * angle)
+            weighted_sin += weight * math.sin(2.0 * angle)
+        alignment_angle = 0.5 * math.atan2(weighted_sin, weighted_cos)
+        alignment_direction_source = "all_work_lines_axial_mean"
     turn_anchors, endpoint_alignment = _align_short_turn_anchors(
         oriented,
-        main_angle=(
-            math.atan2(
-                oriented[0][-1][1] - oriented[0][0][1],
-                oriented[0][-1][0] - oriented[0][0][0],
-            )
-            if oriented and len(oriented[0]) >= 2
-            else 0.0
-        ),
+        main_angle=float(alignment_angle),
         mpp=mpp,
         field_polygon=field_polygon,
         config=cfg,
     )
+    endpoint_alignment["direction_source"] = alignment_direction_source
 
     if entry_point and oriented:
         full_path.append([entry_point, oriented[0][0]])
@@ -1656,6 +1685,8 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         planned_mask=planned_mask,
         headland_mask=cfg.get("headland_mask"),
         support_mask=cfg.get("planning_support_mask"),
+        uncertain_mask=cfg.get("uncertain_mask"),
+        forbidden_mask=cfg.get("forbidden_mask"),
     )
 
     mpp = meters_per_pixel(mask, geo, state)
@@ -1692,6 +1723,9 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
     max_core_overlap = float(cfg.get("max_track_core_overlap_pct", 8.0))
     min_harvest_coverage = float(cfg.get("min_harvest_coverage_pct", 90.0))
     max_outside = float(cfg.get("max_track_outside_field_pct", 2.0))
+    max_outside_support = float(cfg.get("max_track_outside_support_pct", 100.0))
+    max_uncertain = float(cfg.get("max_track_uncertain_overlap_pct", 100.0))
+    max_forbidden = float(cfg.get("max_track_forbidden_overlap_pct", 0.0))
     if footprint["track_core_overlap_pct"] > max_core_overlap:
         issues.append(
             f"履带与稻株核心重叠 {footprint['track_core_overlap_pct']:.1f}% "
@@ -1706,6 +1740,22 @@ def validate_path(full_path: List[List[Tuple[float, float]]],
         issues.append(
             f"履带越界率 {footprint['track_outside_field_pct']:.1f}% "
             f"> {max_outside:.1f}%"
+        )
+    outside_support = footprint.get("track_outside_support_pct")
+    if outside_support is not None and outside_support > max_outside_support:
+        issues.append(
+            f"履带离开语义支撑区 {outside_support:.1f}% "
+            f"> {max_outside_support:.1f}%"
+        )
+    uncertain_overlap = footprint.get("track_uncertain_overlap_pct")
+    if uncertain_overlap is not None and uncertain_overlap > max_uncertain:
+        issues.append(
+            f"履带经过不确定区 {uncertain_overlap:.1f}% > {max_uncertain:.1f}%"
+        )
+    forbidden_overlap = footprint.get("track_forbidden_overlap_pct")
+    if forbidden_overlap is not None and forbidden_overlap > max_forbidden:
+        issues.append(
+            f"履带进入禁行区 {forbidden_overlap:.1f}% > {max_forbidden:.1f}%"
         )
     if crossing_count > 0:
         issues.append(f"非相邻作业线交叉 {crossing_count} 处")
@@ -2232,6 +2282,50 @@ def _build_planning_factor_report(
 #  6. 完整路径规划管道
 # ═══════════════════════════════════════════════════════════════
 
+def _prepare_work_line_layout(
+    wide_bands: List[Dict],
+    processed_mask: np.ndarray,
+    main_angle: float,
+    geo=None,
+    state=None,
+    config: Optional[Dict] = None,
+    progress_callback=None,
+) -> Tuple[List[List[Tuple[float, float]]], Dict]:
+    """Select the declared work-line generator without silent mode fallback."""
+    cfg = dict(config or {})
+    mode = str(cfg.get("work_line_mode", "band_centerline")).strip().lower()
+    if mode == "footprint_optimized":
+        work_lines, layout = generate_work_lines(
+            processed_mask,
+            main_angle,
+            geo=geo,
+            state=state,
+            harvester=_harvester_specs(state),
+            config=cfg,
+            progress_callback=progress_callback,
+        )
+    elif mode == "band_centerline":
+        work_lines, layout = prepare_band_centerlines(
+            wide_bands,
+            main_angle,
+            geo=geo,
+            state=state,
+            config=cfg,
+        )
+        if not work_lines and wide_bands:
+            work_lines = [
+                list(item.get("centerline", []))
+                for item in wide_bands
+                if len(item.get("centerline", [])) >= 2
+            ]
+            layout = {"fallback": "raw_band_centerlines"}
+    else:
+        raise ValueError(f"unsupported work_line_mode: {mode}")
+    layout = dict(layout or {})
+    layout["work_line_mode"] = mode
+    return work_lines, layout
+
+
 def plan_path(wide_bands: List[Dict],
               processed_mask: np.ndarray,
               main_angle: float,
@@ -2311,22 +2405,16 @@ def plan_path(wide_bands: List[Dict],
 
     _report(0.12, "四行带中心线筛选")
     abort_if_cancelled()
-    work_lines, layout = prepare_band_centerlines(
+    work_lines, layout = _prepare_work_line_layout(
         wide_bands,
+        processed_mask,
         main_angle,
         geo=geo,
         state=state,
         config=cfg,
+        progress_callback=progress_callback,
     )
     abort_if_cancelled()
-    if not work_lines and wide_bands:
-        log.warning("足迹优化未生成作业线，回退到种植带中心线")
-        work_lines = [
-            list(item.get("centerline", []))
-            for item in wide_bands
-            if len(item.get("centerline", [])) >= 2
-        ]
-        layout = {"fallback": "band_centerlines"}
     if not work_lines:
         return {
             "full_path": [],
@@ -2362,6 +2450,7 @@ def plan_path(wide_bands: List[Dict],
             turn_strategy=strategy_key,
             config=cfg,
             return_diagnostics=True,
+            global_main_angle=main_angle,
         )
         candidate_assessment["user_requested_strategy"] = turn_strategy
         for decision in candidate_assessment.get("turn_decisions", []) or []:
@@ -2498,7 +2587,7 @@ def plan_path(wide_bands: List[Dict],
         turn_assessment=turn_assessment,
         validation=validation,
     )
-    return {
+    result = {
         "full_path": display_path_segments,
         "segment_types": segment_types,
         "segment_lengths_m": segment_lengths_m,
@@ -2521,3 +2610,9 @@ def plan_path(wide_bands: List[Dict],
         "requested_strategy": turn_strategy,
         "turn_assessment": turn_assessment,
     }
+    from machine_route_validator import assess_machine_readiness
+    result["machine_readiness"] = assess_machine_readiness(
+        result,
+        execution_config=cfg,
+    )
+    return result

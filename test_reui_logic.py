@@ -799,6 +799,42 @@ def test_validate_footprints_uses_neutral_support_without_counting_it_as_crop():
     assert metrics["track_core_overlap_pct"] == 0
 
 
+def test_validate_footprints_keeps_field_support_uncertain_and_forbidden_separate():
+    from footprint_planner import validate_footprints
+
+    class State:
+        field_boundary = [(0, 0), (119, 0), (119, 79), (0, 79)]
+        mask_offset_x = 0
+        mask_offset_y = 0
+
+    body = np.zeros((80, 120), dtype=np.uint8)
+    body[35:45, 50:90] = 255
+    support = np.zeros_like(body)
+    support[:, :30] = 255
+    uncertain = np.zeros_like(body)
+    uncertain[:, 55:65] = 255
+    forbidden = np.zeros_like(body)
+    forbidden[:, 58:62] = 255
+    path = [[(60.0, 10.0), (60.0, 70.0)]]
+
+    metrics = validate_footprints(
+        path,
+        body,
+        state=State(),
+        harvester={"cutter_width_m": 0.04, "track_width_m": 0.04, "track_gauge_m": 0.0},
+        support_mask=support,
+        uncertain_mask=uncertain,
+        forbidden_mask=forbidden,
+        segment_types=["turn"],
+    )
+
+    assert metrics["track_outside_field_pct"] == 0
+    assert metrics["track_outside_support_pct"] > 0
+    assert metrics["track_uncertain_overlap_pct"] > 0
+    assert metrics["track_forbidden_overlap_pct"] > 0
+    assert metrics["forbidden_mask_present"] is True
+
+
 def test_mask_overlay_draws_headland_and_uncertain_as_separate_layers(monkeypatch):
     """DECISION-009: uncertain residuals must not look like work-body pixels."""
     window = _window()

@@ -478,7 +478,7 @@ class MainWindow(QMainWindow):
         self._sync_task_statuses()
         bands_count = len(result.get("bands", []))
         tracks = len(path_result.get("tracks", []))
-        turns = len(path_result.get("turns", []))
+        turns = len(path_result.get("formal_turns", path_result.get("turns", [])))
         self.lbl_status.setText("路径规划完成")
         self.log_panel.success(self._path_quality_summary(path_result, bands_count, tracks, turns))
         self._log_turn_strategy_comparison(path_result)
@@ -1853,7 +1853,8 @@ class MainWindow(QMainWindow):
         segment_types = list(normalised.get("segment_types") or [])
 
         if full_path:
-            tracks, turns, ordered = [], [], []
+            tracks, turns, formal_turns, approaches = [], [], [], []
+            reverse_turns, service_segments, ordered = [], [], []
             for index, raw_points in enumerate(full_path):
                 points = self._coerce_points(raw_points)
                 if len(points) < 2:
@@ -1880,14 +1881,30 @@ class MainWindow(QMainWindow):
                     tracks.append(item)
                 else:
                     turns.append(item)
+                    if segment_type == "turn":
+                        formal_turns.append(item)
+                    elif segment_type == "turn_approach":
+                        approaches.append(item)
+                    elif segment_type in ("turn_reverse", "turn_aux"):
+                        reverse_turns.append(item)
+                    elif segment_type in ("entry", "exit", "unload"):
+                        service_segments.append(item)
             normalised["full_path"] = [item["points"] for item in ordered]
             normalised["segment_types"] = [item["type"] for item in ordered]
             normalised["tracks"] = tracks
             normalised["turns"] = turns
+            normalised["formal_turns"] = formal_turns
+            normalised["turn_approaches"] = approaches
+            normalised["reverse_turns"] = reverse_turns
+            normalised["service_segments"] = service_segments
             normalised["ordered_segments"] = ordered
         else:
             tracks = normalised.get("tracks", [])
             turns = normalised.get("turns", [])
+            normalised.setdefault("formal_turns", list(turns))
+            normalised.setdefault("turn_approaches", [])
+            normalised.setdefault("reverse_turns", [])
+            normalised.setdefault("service_segments", [])
             normalised["ordered_segments"] = list(tracks) + list(turns)
         return normalised
 
@@ -2212,6 +2229,8 @@ class MainWindow(QMainWindow):
                 "sha256": self._sha256_file(output_path, use_cache=False),
                 "point_count": len(geo_points),
                 "coordinate_crs": "EPSG:4326",
+                "route_classification": "research_manual_review",
+                "machine_executable": False,
             },
             "source_image": {
                 "path": os.path.abspath(self._tif_path) if self._tif_path else "",
@@ -2240,6 +2259,9 @@ class MainWindow(QMainWindow):
                 "turn_strategy": str(getattr(self.state, "turn_strategy", "")),
                 "validation": self._manifest_jsonable(
                     path_result.get("validation", {}) or {}
+                ),
+                "machine_readiness": self._manifest_jsonable(
+                    path_result.get("machine_readiness", {}) or {}
                 ),
                 "planning_factors": self._manifest_jsonable(
                     path_result.get("planning_factors", {}) or {}
@@ -2431,8 +2453,8 @@ class MainWindow(QMainWindow):
         path_result = self._normalise_path_result(path_result)
         validation = path_result.get("validation", {}) or {}
         tracks_count = len(path_result.get("tracks", [])) if tracks_count is None else tracks_count
-        turns_count = len(path_result.get("turns", [])) if turns_count is None else turns_count
-        parts = [f"路径规划完成: {tracks_count} 条作业线, {turns_count} 条转弯段", f"调头方式：{self._turn_strategy_label(path_result)}"]
+        turns_count = len(path_result.get("formal_turns", path_result.get("turns", []))) if turns_count is None else turns_count
+        parts = [f"路径规划完成: {tracks_count} 条作业线, {turns_count} 条正式调头段", f"调头方式：{self._turn_strategy_label(path_result)}"]
         total = validation.get("total_length_m", path_result.get("total_length_m"))
         work = validation.get("work_length_m", path_result.get("work_length_m"))
         turn = validation.get("turn_length_m", path_result.get("turn_length_m"))
@@ -2519,7 +2541,7 @@ class MainWindow(QMainWindow):
             self._service_points_visible = True
             self._show_path(pr)
         tracks = len(pr.get("tracks", []))
-        turns = len(pr.get("turns", []))
+        turns = len(pr.get("formal_turns", pr.get("turns", [])))
         bands = len(result.get("bands", []))
         self.log_panel.success(self._path_quality_summary(pr, bands, tracks, turns))
         self._log_turn_strategy_comparison(pr)
@@ -2930,30 +2952,25 @@ class MainWindow(QMainWindow):
     def _on_segment_selected(self, idx):
         pr = self._pipeline_result or {}
         path = self._normalise_path_result(pr.get("path", {}))
-        tracks = path.get("tracks", [])
-        turns = path.get("turns", [])
-        all_segs = []
-        for t in tracks:
-            all_segs.append({"type": "track", "points": t.get("points", [])})
-        for t in turns:
-            all_segs.append({"type": "turn", "points": t.get("points", [])})
-        if 0 <= idx < len(all_segs):
-            seg = all_segs[idx]
+        all_segs = list(path.get("ordered_segments", []) or [])
+        seg = next(
+            (item for item in all_segs if int(item.get("segment_index", -1)) == idx),
+            None,
+        )
+        if seg is not None:
             self.log_panel.info(f"选中路线段 {idx + 1}: {seg['type']}")
             if self._tif_rgb is not None:
                 ov = self._tif_rgb.copy()
-                for t in tracks:
+                for t in all_segs:
                     pts = np.array(t.get("points", []))
                     if len(pts) > 1:
-                        cv2.polylines(ov, [pts.astype(np.int32)], False, (0, 150, 40), 2)
-                for t in turns:
-                    pts = np.array(t.get("points", []))
-                    if len(pts) > 1:
-                        cv2.polylines(ov, [pts.astype(np.int32)], False, (150, 50, 50), 1)
+                        is_work = t.get("type") == "work"
+                        color = (0, 150, 40) if is_work else (150, 50, 50)
+                        cv2.polylines(ov, [pts.astype(np.int32)], False, color, 2 if is_work else 1)
                 if seg.get("points"):
                     pts = np.array(seg["points"])
                     if len(pts) > 1:
-                        hl_color = (0, 255, 80) if seg["type"] == "track" else (80, 80, 255)
+                        hl_color = (0, 255, 80) if seg["type"] == "work" else (80, 80, 255)
                         cv2.polylines(ov, [pts.astype(np.int32)], False, hl_color, 5)
                 self.image_view.set_image(ov)
 
@@ -3410,7 +3427,7 @@ class MainWindow(QMainWindow):
             "",
             "分析依据",
             f"- 调头策略：{self._turn_strategy_label(path_result)}",
-            f"- 作业线/转弯段：{len(path_result.get('tracks', []))} / {len(path_result.get('turns', []))}",
+            f"- 作业线/正式调头段：{len(path_result.get('tracks', []))} / {len(path_result.get('formal_turns', path_result.get('turns', [])))}",
             f"- 覆盖率：{coverage:.1f}%，履带重叠：{rolling:.1f}%，履带越界：{outside:.1f}%",
             *[f"- {reason}" for reason in reasons],
             "",
@@ -3451,7 +3468,7 @@ class MainWindow(QMainWindow):
         path_result = self._normalise_path_result(path_result)
         data = {
             "track_count": len(path_result.get("tracks", [])),
-            "turn_count": len(path_result.get("turns", [])),
+            "turn_count": len(path_result.get("formal_turns", path_result.get("turns", []))),
             "total_length_m": validation.get("total_length_m", 0),
             "area_m2": validation.get("harvest_area_m2", 0),
             "turn_strategy": getattr(self.state, 'turn_strategy', 'auto'),

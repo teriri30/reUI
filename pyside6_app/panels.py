@@ -504,10 +504,16 @@ class TaskPanel(QWidget):
 
 class RouteSegmentRow(QWidget):
     clicked = Signal(int)
-    def __init__(self, index, label, distance_m, is_work=True, parent=None):
+    def __init__(self, index, label, distance_m, is_work=True, parent=None, segment_type=None):
         super().__init__(parent); self._index = index; self._is_work = is_work
+        self._segment_type = str(segment_type or ("work" if is_work else "turn"))
         lo = QHBoxLayout(self); lo.setContentsMargins(8, 3, 8, 3); lo.setSpacing(8)
-        self._badge = QLabel("线" if is_work else "转"); self._badge.setFixedSize(24, 18); self._badge.setAlignment(Qt.AlignCenter)
+        badge = {
+            "work": "线", "turn_approach": "接", "turn": "转",
+            "turn_reverse": "倒", "turn_aux": "辅", "entry": "进",
+            "exit": "出", "unload": "卸",
+        }.get(self._segment_type, "段")
+        self._badge = QLabel(badge); self._badge.setFixedSize(24, 18); self._badge.setAlignment(Qt.AlignCenter)
         self._label = QLabel(f"{label} {index + 1:02d}")
         self._dist = QLabel(f"{distance_m:.1f} m")
         lo.addWidget(self._badge)
@@ -515,7 +521,12 @@ class RouteSegmentRow(QWidget):
         lo.addWidget(self._dist)
         self.refresh_theme()
     def refresh_theme(self):
-        self._badge.setStyleSheet(f"background:{'#529C62' if self._is_work else '#BA9648'};color:white;border-radius:2px;font-size:10px;")
+        color = {
+            "work": "#529C62", "turn_approach": "#4C7FA8", "turn": "#BA9648",
+            "turn_reverse": "#A85A5A", "turn_aux": "#8A6E9E", "entry": "#4F8790",
+            "exit": "#6A7780", "unload": "#8C7353",
+        }.get(self._segment_type, "#6A7780")
+        self._badge.setStyleSheet(f"background:{color};color:white;border-radius:2px;font-size:10px;")
         self._label.setStyleSheet(f"color:{COLORS['text']};font-size:12px;")
         self._dist.setStyleSheet(f"color:{COLORS['text_dim']};font-family:Consolas;")
     def mousePressEvent(self, event):
@@ -546,17 +557,40 @@ class RouteInfoPanel(QWidget):
         self._segments.clear(); self._list_layout.addStretch()
     def _add_row(self, row):
         self._list_layout.insertWidget(max(0, self._list_layout.count()-1), row)
+    @staticmethod
+    def _segment_label(segment_type):
+        return {
+            "work": "作业线", "turn_approach": "转弯接近", "turn": "正式调头",
+            "turn_reverse": "倒车段", "turn_aux": "调头辅助", "entry": "进田段",
+            "exit": "出田段", "unload": "卸粮段",
+        }.get(str(segment_type), "其他路段")
     def update_route(self, data, validation=None):
         data = data or {}
         tracks = data.get("tracks", []); turns = data.get("turns", [])
         validation = validation or data.get("validation", {}) or {}
-        self._clear_list(); self._empty_label.setVisible(not (tracks or turns))
-        idx = 0
-        for t in tracks:
-            row = RouteSegmentRow(idx, "作业线", float(t.get("length", self._calc_distance(t.get("points", []))) or 0.0), True); row.clicked.connect(self.segment_selected.emit); self._add_row(row); idx += 1
-        for t in turns:
-            row = RouteSegmentRow(idx, "转弯段", float(t.get("length", self._calc_distance(t.get("points", []))) or 0.0), False); row.clicked.connect(self.segment_selected.emit); self._add_row(row); idx += 1
-        parts = [f"作业线 {len(tracks)}", f"转弯段 {len(turns)}"]
+        ordered = list(data.get("ordered_segments") or [])
+        if not ordered:
+            ordered = [dict(segment, type=segment.get("type", "work")) for segment in tracks]
+            ordered.extend(
+                dict(segment, type=segment.get("type", "turn")) for segment in turns
+            )
+        self._clear_list(); self._empty_label.setVisible(not ordered)
+        counts = {}
+        for fallback_index, segment in enumerate(ordered):
+            segment_type = str(segment.get("type", "turn"))
+            counts[segment_type] = counts.get(segment_type, 0) + 1
+            segment_index = int(segment.get("segment_index", fallback_index))
+            length = float(segment.get("length", self._calc_distance(segment.get("points", []))) or 0.0)
+            row = RouteSegmentRow(
+                segment_index, self._segment_label(segment_type), length,
+                segment_type == "work", segment_type=segment_type,
+            )
+            row.clicked.connect(self.segment_selected.emit); self._add_row(row)
+        parts = [f"作业线 {counts.get('work', 0)}", f"正式调头 {counts.get('turn', 0)}"]
+        if counts.get("turn_approach"): parts.append(f"接近 {counts['turn_approach']}")
+        if counts.get("turn_reverse"): parts.append(f"倒车 {counts['turn_reverse']}")
+        service_count = sum(counts.get(key, 0) for key in ("entry", "exit", "unload"))
+        if service_count: parts.append(f"进出田/卸粮 {service_count}")
         total = float(validation.get("total_length_m", data.get("total_length_m", 0.0)) or 0.0)
         work = float(validation.get("work_length_m", data.get("work_length_m", 0.0)) or 0.0)
         turn = float(validation.get("turn_length_m", data.get("turn_length_m", 0.0)) or 0.0)
@@ -578,15 +612,18 @@ class RouteInfoPanel(QWidget):
             self._summary.setText(" / ".join(parts))
     def update_from_auto_path(self, auto_path):
         self._clear_list(); self._empty_label.setVisible(not bool(auto_path))
-        work = turn = 0; total = work_len = turn_len = 0.0
+        counts = {}; total = work_len = turn_len = 0.0
         for idx, seg in enumerate(auto_path or []):
-            typ = getattr(seg, 'segment_type', 'work'); is_work = typ == 'work'; work += int(is_work); turn += int(not is_work)
+            typ = str(getattr(seg, 'segment_type', 'work')); is_work = typ == 'work'
+            counts[typ] = counts.get(typ, 0) + 1
             length = float(getattr(seg, 'length_m', 0.0) or 0.0); total += length
             if is_work: work_len += length
-            else: turn_len += length
-            row = RouteSegmentRow(idx, "作业线" if is_work else "转弯段", length, is_work)
+            elif typ.startswith("turn"): turn_len += length
+            row = RouteSegmentRow(idx, self._segment_label(typ), length, is_work, segment_type=typ)
             row.clicked.connect(self.segment_selected.emit); self._add_row(row)
-        parts = [f"作业线 {work}", f"转弯段 {turn}"]
+        parts = [f"作业线 {counts.get('work', 0)}", f"正式调头 {counts.get('turn', 0)}"]
+        if counts.get("turn_approach"): parts.append(f"接近 {counts['turn_approach']}")
+        if counts.get("turn_reverse"): parts.append(f"倒车 {counts['turn_reverse']}")
         if total > 0: parts.append(f"总长 {total:.1f}m")
         if work_len > 0: parts.append(f"作业 {work_len:.1f}m")
         if turn_len > 0: parts.append(f"转弯 {turn_len:.1f}m")

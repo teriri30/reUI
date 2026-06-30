@@ -632,6 +632,7 @@ class PlanWorker(QObject):
             config = dict(self.config)
             config.setdefault("headland_mask", self.mask_result.get("headland_mask"))
             config.setdefault("planning_support_mask", self.mask_result.get("planning_support_mask"))
+            config.setdefault("uncertain_mask", self.mask_result.get("uncertain_residual_mask"))
             config["_cancel_callback"] = lambda: self._cancelled
             path_result = plan_path(
                 wide_bands, processed_mask, main_angle,
@@ -652,6 +653,7 @@ class PlanWorker(QObject):
                 key: value for key, value in self.config.items()
                 if not str(key).startswith("_") and key not in {
                     "headland_mask", "planning_support_mask", "uncertain_residual_mask",
+                    "uncertain_mask", "forbidden_mask",
                     "neutral_support_mask",
                 }
             })

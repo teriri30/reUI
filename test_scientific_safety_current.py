@@ -112,6 +112,34 @@ def test_route_info_theme_refresh_does_not_call_task_panel_methods():
     app.processEvents()
 
 
+def test_route_info_distinguishes_approach_turn_reverse_and_service_segments():
+    from pyside6_app.panels import RouteInfoPanel, RouteSegmentRow
+
+    app = QApplication.instance() or QApplication([])
+    panel = RouteInfoPanel()
+    panel.update_route({
+        "ordered_segments": [
+            {"segment_index": 0, "type": "work", "points": [(0, 0), (1, 0)]},
+            {"segment_index": 1, "type": "turn_approach", "points": [(1, 0), (2, 0)]},
+            {"segment_index": 2, "type": "turn", "points": [(2, 0), (2, 1)]},
+            {"segment_index": 3, "type": "turn_reverse", "points": [(2, 1), (1, 1)]},
+            {"segment_index": 4, "type": "exit", "points": [(1, 1), (0, 1)]},
+        ]
+    })
+
+    summary = panel._summary.toolTip()
+    assert "作业线 1" in summary
+    assert "正式调头 1" in summary
+    assert "接近 1" in summary
+    assert "倒车 1" in summary
+    assert "进出田/卸粮 1" in summary
+    assert [row._segment_type for row in panel.findChildren(RouteSegmentRow)] == [
+        "work", "turn_approach", "turn", "turn_reverse", "exit"
+    ]
+    panel.deleteLater()
+    app.processEvents()
+
+
 def test_invalid_or_manually_edited_path_is_blocked_from_export():
     from pyside6_app.main_window import MainWindow
 

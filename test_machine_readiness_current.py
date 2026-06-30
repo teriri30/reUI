@@ -1,0 +1,76 @@
+import numpy as np
+
+
+def _valid_path_result(mode="footprint_optimized"):
+    return {
+        "is_valid": True,
+        "validation": {
+            "valid": True,
+            "field_boundary_present": True,
+            "semantic_support_present": True,
+            "forbidden_mask_present": True,
+        },
+        "layout": {"work_line_mode": mode},
+        "turn_assessment": {"hard_reasons": []},
+    }
+
+
+def test_machine_readiness_is_fail_closed_without_external_evidence():
+    from machine_route_validator import assess_machine_readiness
+
+    readiness = assess_machine_readiness(_valid_path_result())
+
+    assert readiness["eligible_for_machine_export"] is False
+    assert "external_geo_accuracy_not_verified" in readiness["blockers"]
+    assert "full_vehicle_kinematics_not_validated" in readiness["blockers"]
+    assert readiness["current_route_classification"] == "research_manual_review"
+
+
+def test_machine_readiness_accepts_only_complete_verified_evidence():
+    from machine_route_validator import assess_machine_readiness
+
+    readiness = assess_machine_readiness(
+        _valid_path_result(),
+        {
+            "forbidden_mask_confirmed": True,
+            "geo_accuracy_report": {
+                "verified": True,
+                "rmse_m": 0.03,
+                "within_tolerance": True,
+            },
+            "vehicle_reference_point": "rear_axle_center",
+            "gnss_offset_m": [0.0, 0.0, 1.8],
+            "kinematic_model_validated": True,
+            "terminal_adapter": "verified_test_adapter",
+            "terminal_adapter_validated": True,
+            "field_tracking_report": {"verified": True},
+            "manual_review_signed": True,
+        },
+    )
+
+    assert readiness["eligible_for_machine_export"] is True
+    assert readiness["blockers"] == []
+
+
+def test_footprint_work_line_mode_uses_generator_without_fallback(monkeypatch):
+    import path_planner
+
+    expected = [[(1.0, 2.0), (3.0, 4.0)]]
+    called = {}
+
+    def fake_generate(mask, angle, **kwargs):
+        called["shape"] = mask.shape
+        called["angle"] = angle
+        return expected, {"generated_pass_count": 1}
+
+    monkeypatch.setattr(path_planner, "generate_work_lines", fake_generate)
+    lines, layout = path_planner._prepare_work_line_layout(
+        [],
+        np.zeros((20, 30), dtype=np.uint8),
+        0.25,
+        config={"work_line_mode": "footprint_optimized"},
+    )
+
+    assert lines == expected
+    assert layout["work_line_mode"] == "footprint_optimized"
+    assert called == {"shape": (20, 30), "angle": 0.25}

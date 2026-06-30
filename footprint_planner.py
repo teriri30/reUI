@@ -422,6 +422,8 @@ def validate_footprints(
     planned_mask: Optional[np.ndarray] = None,
     headland_mask: Optional[np.ndarray] = None,
     support_mask: Optional[np.ndarray] = None,
+    uncertain_mask: Optional[np.ndarray] = None,
+    forbidden_mask: Optional[np.ndarray] = None,
 ) -> Dict:
     """Validate footprints without conflating crop evidence and field support.
 
@@ -431,6 +433,12 @@ def validate_footprints(
     cfg = config or {}
     if headland_mask is None:
         headland_mask = cfg.get("headland_mask")
+    if support_mask is None:
+        support_mask = cfg.get("planning_support_mask")
+    if uncertain_mask is None:
+        uncertain_mask = cfg.get("uncertain_mask")
+    if forbidden_mask is None:
+        forbidden_mask = cfg.get("forbidden_mask")
     specs = harvester or {}
     cutter_width_m = float(specs.get("cutter_width_m", 2.15))
     track_width_m = float(specs.get("track_width_m", 0.4))
@@ -484,20 +492,49 @@ def validate_footprints(
             )
             headland = (headland >= 96).astype(np.uint8) * 255
     support_source = raw
+    semantic_support = None
     if support_mask is not None:
         candidate_support = (np.asarray(support_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
         if candidate_support.shape[:2] == raw.shape[:2]:
             support_source = candidate_support
+            semantic_support = cv2.resize(
+                candidate_support,
+                (soft.shape[1], soft.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
     elif headland is not None:
         support_source = cv2.bitwise_or(
             raw,
             (np.asarray(headland_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255,
         )
-    support = cv2.resize(
+        semantic_support = cv2.resize(
+            support_source,
+            (soft.shape[1], soft.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    field_support = cv2.resize(
         _field_support(support_source, state),
         (soft.shape[1], soft.shape[0]),
         interpolation=cv2.INTER_NEAREST,
     )
+    uncertain = None
+    if uncertain_mask is not None:
+        candidate = (np.asarray(uncertain_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+        if candidate.shape[:2] == raw.shape[:2]:
+            uncertain = cv2.resize(
+                candidate,
+                (soft.shape[1], soft.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+    forbidden = None
+    if forbidden_mask is not None:
+        candidate = (np.asarray(forbidden_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+        if candidate.shape[:2] == raw.shape[:2]:
+            forbidden = cv2.resize(
+                candidate,
+                (soft.shape[1], soft.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
     work_mpp = mpp / scale
     erosion_m = float(cfg.get("crop_core_erosion_m", 0.10))
     erosion_px = max(1, int(round(erosion_m / work_mpp)))
@@ -571,7 +608,24 @@ def validate_footprints(
         if planned is not None
         else harvested
     )
-    outside = int(np.count_nonzero((track_swept > 0) & (support == 0)))
+    outside_field = int(
+        np.count_nonzero((track_swept > 0) & (field_support == 0))
+    )
+    outside_support = (
+        int(np.count_nonzero((track_swept > 0) & (semantic_support == 0)))
+        if semantic_support is not None
+        else None
+    )
+    uncertain_track = (
+        int(np.count_nonzero((track_swept > 0) & (uncertain > 0)))
+        if uncertain is not None
+        else None
+    )
+    forbidden_track = (
+        int(np.count_nonzero((track_swept > 0) & (forbidden > 0)))
+        if forbidden is not None
+        else None
+    )
     headland_track = (
         int(np.count_nonzero((track_swept > 0) & (headland > 0)))
         if headland is not None
@@ -589,7 +643,28 @@ def validate_footprints(
             if detected is not None
             else 0.0
         ),
-        "track_outside_field_pct": outside / track_area * 100.0,
+        "track_outside_field_pct": outside_field / track_area * 100.0,
+        "track_outside_support_pct": (
+            outside_support / track_area * 100.0
+            if outside_support is not None
+            else None
+        ),
+        "track_uncertain_overlap_pct": (
+            uncertain_track / track_area * 100.0
+            if uncertain_track is not None
+            else None
+        ),
+        "track_forbidden_overlap_pct": (
+            forbidden_track / track_area * 100.0
+            if forbidden_track is not None
+            else None
+        ),
+        "field_boundary_present": bool(
+            state is not None and len(getattr(state, "field_boundary", None) or []) >= 3
+        ),
+        "semantic_support_present": semantic_support is not None,
+        "uncertain_mask_present": uncertain is not None,
+        "forbidden_mask_present": forbidden is not None,
         "track_headland_overlap_pct": headland_track / track_area * 100.0,
         "footprint_resolution_m": float(work_mpp),
         "crop_core_erosion_m": erosion_m,

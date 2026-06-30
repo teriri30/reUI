@@ -42,15 +42,20 @@
     "turn_radius_m": 1.0
   },
   "path_planning": {
+    "work_line_mode": "band_centerline",
     "min_turn_radius_m": 1.0,
     "planning_max_dim": 3600,
     "validation_max_dim": 3000,
     "endpoint_short_line_ratio": 0.85,
     "endpoint_shortfall_min_m": 0.5,
     "endpoint_extension_max_m": 4.0,
+    "endpoint_outlier_mad_scale": 3.0,
     "max_track_core_overlap_pct": 8.0,
     "min_harvest_coverage_pct": 90.0,
-    "max_track_outside_field_pct": 2.0
+    "max_track_outside_field_pct": 2.0,
+    "max_track_outside_support_pct": 100.0,
+    "max_track_uncertain_overlap_pct": 100.0,
+    "max_track_forbidden_overlap_pct": 0.0
   },
   "mask_processing": {
     "strength": "standard",
