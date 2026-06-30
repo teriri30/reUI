@@ -4,6 +4,8 @@
 
 ## 项目定位
 
+<!-- DECISION-008: 科研原型能力边界。修改前阅读 docs/DECISIONS.md。 -->
+
 - 适用：论文方法验证、内部实验、受控条件下的田间试验准备。
 - 不适用：未经人工复核直接驱动农机、通用地形安全判断或商业化无人作业。
 - 当前农机尺寸建议是启发式候选，不包含 DEM、土壤承载力、重心和侧翻模型。
@@ -47,6 +49,8 @@ D:\zhl\anaconda\envs\game\python.exe integrity_check.py path_result.csv.manifest
 
 ## 文档
 
+- [AI 修改规则](AI_RULES.md)
+- [关键设计决策](docs/DECISIONS.md)
 - [科研验证协议](docs/SCIENTIFIC_VALIDATION.md)
 - [数据与溯源契约](docs/DATA_CONTRACTS.md)
 

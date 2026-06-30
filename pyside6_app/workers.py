@@ -26,7 +26,12 @@ def display_affine(source_affine, full_width, full_height, display_width, displa
 
 
 def require_metric_scale(geo, state, shape) -> float:
-    """Return a verified metres-per-pixel value or stop metric processing."""
+    """DECISION-003: return verified metres-per-pixel or stop processing.
+
+    Crop geometry and machine dimensions are physical quantities. Missing,
+    guessed, anisotropic or spatially unstable scale must never be replaced by
+    a convenient pixel fallback. See docs/DECISIONS.md.
+    """
     if geo is None or not geo.is_ready():
         raise RuntimeError("影像没有有效地理配准，不能执行米制掩膜处理或路径规划")
     if state is None or shape is None or len(shape) < 2:
@@ -174,7 +179,12 @@ class TifLoadWorker(QObject):
 
 
 class CacheRestoreWorker(QObject):
-    """Load project JSON and large mask caches outside the GUI thread."""
+    """DECISION-002: restore only artifacts with a complete valid evidence chain.
+
+    Source, model, configuration, upstream fingerprint and artifact hash are
+    checked stage by stage. A mismatch invalidates that stage and all of its
+    dependants instead of guessing legacy compatibility.
+    """
     progress = Signal(int, str)
     finished = Signal(dict)
     error = Signal(str)

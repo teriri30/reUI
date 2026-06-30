@@ -1,4 +1,4 @@
-"""Reproducible RGB selection and radiometric preprocessing for GeoTIFF input."""
+"""DECISION-005: reproducible GeoTIFF RGB and radiometric preprocessing."""
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
@@ -7,6 +7,10 @@ import numpy as np
 
 
 RASTER_PREPROCESSING_VERSION = "rgb-percentile-v1"
+
+
+class EmptyRasterWindowError(ValueError):
+    """The requested window contains no valid pixel in any selected RGB band."""
 
 
 def _band_names(color_interpretations: Sequence[Any]) -> list[str]:
@@ -51,6 +55,11 @@ def normalise_raster_bands(
     valid_masks: np.ndarray | None = None,
     config: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, dict]:
+    """Apply the versioned, NoData-aware radiometric input contract.
+
+    DECISION-005 requires native uint8 values to remain byte-exact and every
+    non-uint8 scaling range to be recorded for later audit.
+    """
     values = np.asarray(bands)
     if values.ndim != 3 or values.shape[0] != 3:
         raise ValueError("RGB raster data must have shape (3, height, width)")
@@ -63,6 +72,10 @@ def normalise_raster_bands(
             raise ValueError("raster validity masks must match RGB band shape")
         valid = masks > 0
     valid &= np.isfinite(values)
+
+    valid_counts = np.count_nonzero(valid, axis=(1, 2))
+    if np.all(valid_counts == 0):
+        raise EmptyRasterWindowError("RGB window contains no valid pixels")
 
     output = np.zeros(values.shape, dtype=np.uint8)
     band_metadata = []
@@ -118,6 +131,10 @@ def read_rgb_raster(
     resampling=None,
     config: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, dict]:
+    """Read RGB by declared color interpretation and preserve audit metadata.
+
+    This is the only GeoTIFF-to-model RGB boundary under DECISION-005.
+    """
     indexes = select_rgb_band_indexes(dataset.count, getattr(dataset, "colorinterp", ()))
     read_kwargs = {}
     if window is not None:

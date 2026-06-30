@@ -104,6 +104,7 @@ def verify_stage_record(
     current_inputs: Mapping[str, Any],
     artifact: Any,
 ) -> bool:
+    """DECISION-002: reject a stage whose inputs or artifact no longer match."""
     if not isinstance(record, Mapping):
         raise ProvenanceError(f"{stage} provenance record is missing")
     if int(record.get("schema", 0)) != PROVENANCE_SCHEMA_VERSION:

@@ -212,6 +212,7 @@ def test_tif_loader_builds_wgs84_transformer_from_source_crs(tmp_path):
 
 
 def test_tif_loader_rejects_crs_without_valid_affine_geotransform(tmp_path):
+    """DECISION-003: a CRS label alone cannot establish usable georeferencing."""
     import numpy as np
     import rasterio
     from pyside6_app.workers import TifLoadWorker
@@ -281,6 +282,7 @@ def test_export_payload_recomputes_stale_coordinates_from_display_path():
 
 
 def test_export_rejects_service_point_change_after_path_planning():
+    """DECISION-007: changed service points invalidate formal route export."""
     window = _window_with_path()
     window.state.entry_point = (5.0, 5.0)
 
@@ -289,6 +291,7 @@ def test_export_rejects_service_point_change_after_path_planning():
 
 
 def test_export_rejects_model_content_change_after_inference():
+    """DECISION-006: changed model bytes invalidate downstream formal output."""
     window = _window_with_path()
     with open(window.state.current_model_path, "wb") as handle:
         handle.write(b"changed-model")

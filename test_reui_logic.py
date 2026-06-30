@@ -248,6 +248,7 @@ def test_field_area_uses_display_geotransform_and_is_persisted():
 
 
 def test_segment_uses_source_geotiff_instead_of_downsampled_preview(monkeypatch):
+    """DECISION-004: formal inference reads source pixels, never preview pixels."""
     window = _window()
     window._tif_path = "D:/zhlonly/project/reUI/data/tif/result.tif"
     window.state.tif_path = window._tif_path
@@ -277,6 +278,158 @@ def test_segment_uses_source_geotiff_instead_of_downsampled_preview(monkeypatch)
         window.state.field_boundary,
         4,
     )]
+
+
+def test_source_tif_inference_streams_oversized_crop_at_source_tile_size(monkeypatch):
+    """DECISION-004: oversized crops stream native source tiles without global resize."""
+    import sys
+    import types
+
+    import cache
+    import model
+    import provenance
+    from raster_preprocessing import EmptyRasterWindowError
+    from state import AppState
+
+    state = AppState()
+    state.tif_path = "D:/fake/result.tif"
+    state.field_boundary = [(0, 0), (3762, 0), (3762, 5139), (0, 5139)]
+    state.current_model_path = "D:/fake/model.pt"
+    state.current_model_name = "model.pt"
+    state.source_sha256 = "source-sha"
+    state.model_sha256 = "model-sha"
+    engine = model.ModelEngine()
+    engine._loaded = True
+    engine._model = object()
+    runner = model.InferenceRunner(state, engine, geo=None)
+    runner.cfg.update_section("model", {"max_source_crop_pixels": 36_000_000})
+    calls = {}
+
+    class FakeDataset:
+        width = 15078
+        height = 21021
+        count = 3
+        colorinterp = ()
+        nodatavals = (None, None, None)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_open(path):
+        calls["opened"] = path
+        return FakeDataset()
+
+    def fake_read_rgb_raster(dataset, *, window=None, out_shape=None, resampling=None, config=None):
+        calls.setdefault("windows", []).append(window)
+        calls.setdefault("out_shapes", []).append(out_shape)
+        calls.setdefault("resampling", []).append(resampling)
+        if len(calls["windows"]) == 1:
+            calls["empty_tiles"] = calls.get("empty_tiles", 0) + 1
+            raise EmptyRasterWindowError("RGB window contains no valid pixels")
+        height = int(window.height)
+        width = int(window.width)
+        return np.ones((height, width, 3), dtype=np.uint8), {"fake": True}
+
+    class FakeTensor:
+        def __init__(self, array):
+            self._array = array
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self._array
+
+    class FakeMasks:
+        def __init__(self, shape):
+            self.data = FakeTensor(np.ones((1, shape[0], shape[1]), dtype=np.float32))
+
+    class FakeResult:
+        def __init__(self, shape):
+            self.masks = FakeMasks(shape)
+
+    def fake_predict(images, conf=None, iou=None):
+        if isinstance(images, list):
+            calls.setdefault("predict_batches", []).append(len(images))
+            calls["inference_shape"] = images[0].shape
+            return [FakeResult(img.shape[:2]) for img in images]
+        calls.setdefault("predict_singles", []).append(images.shape)
+        calls["inference_shape"] = images.shape
+        return [FakeResult(images.shape[:2])]
+
+    saved = []
+    fake_workflow = types.SimpleNamespace(
+        WorkflowUpdater=types.SimpleNamespace(advance=lambda *args, **kwargs: None)
+    )
+
+    monkeypatch.setitem(sys.modules, "workflow", fake_workflow)
+    monkeypatch.setattr("rasterio.open", fake_open)
+    monkeypatch.setattr("raster_preprocessing.read_rgb_raster", fake_read_rgb_raster)
+    monkeypatch.setattr(engine, "predict", fake_predict)
+    monkeypatch.setattr(
+        cache,
+        "save_mask",
+        lambda tif_path, mask, offset_x=0, offset_y=0, suffix="", meta=None, commit_callback=None: saved.append(
+            (mask.shape, offset_x, offset_y, suffix, meta)
+        ) or True,
+    )
+    monkeypatch.setattr(cache, "save_project_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(provenance, "file_sha256", lambda path: "sha")
+    monkeypatch.setattr(provenance, "make_stage_record", lambda *args, **kwargs: {"stage": "inference"})
+
+    runner._run_from_tif(
+        "D:/fake/result.tif",
+        (5255, 3769),
+        state.field_boundary,
+        downsample=4,
+    )
+
+    assert calls["opened"] == "D:/fake/result.tif"
+    assert calls["windows"]
+    assert calls["empty_tiles"] == 1
+    assert all(shape is None for shape in calls["out_shapes"])
+    assert all(resampling is None for resampling in calls["resampling"])
+    first_window = calls["windows"][0]
+    assert int(first_window.width) == 640
+    assert int(first_window.height) == 640
+    assert calls["inference_shape"][:2] == (640, 640)
+    assert state.inference_done is True
+    assert state.inference_running is False
+    assert state.mask_raw.shape == (5255, 3769)
+    assert state.mask_offset_x == 0
+    assert state.mask_offset_y == 0
+    assert saved and saved[0][0] == state.mask_raw.shape
+
+
+def test_source_tif_inference_rejects_crop_with_only_nodata_tiles(monkeypatch):
+    """DECISION-004: an entirely empty crop must not become a valid background result."""
+    import pytest
+
+    import model
+    from raster_preprocessing import EmptyRasterWindowError
+    from state import AppState
+
+    runner = model.InferenceRunner(AppState(), model.ModelEngine(), geo=None)
+    monkeypatch.setattr(
+        "raster_preprocessing.read_rgb_raster",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            EmptyRasterWindowError("RGB window contains no valid pixels")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="no valid RGB pixels"):
+        runner._run_source_tif_tiles(
+            object(),
+            x0_src=0,
+            y0_src=0,
+            crop_w=640,
+            crop_h=640,
+            out_w=160,
+            out_h=160,
+        )
 
 
 def test_default_harvester_params_are_complete():

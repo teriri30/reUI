@@ -39,6 +39,7 @@ def test_invalid_scientific_config_is_rejected(payload, message):
 
 
 def test_stage_record_rejects_changed_model_or_artifact(tmp_path):
+    """DECISION-002: cached stages remain bound to model and artifact hashes."""
     from provenance import ProvenanceError, array_sha256, file_sha256, make_stage_record, verify_stage_record
 
     model = tmp_path / "model.pt"
@@ -80,6 +81,7 @@ def test_mask_stage_record_rejects_any_parameter_change():
 
 
 def test_uint16_preprocessing_is_per_band_deterministic_and_masks_nodata():
+    """DECISION-005: raster normalization is deterministic and nodata-aware."""
     from raster_preprocessing import RASTER_PREPROCESSING_VERSION, normalise_raster_bands
 
     bands = np.array(
@@ -106,7 +108,19 @@ def test_uint16_preprocessing_is_per_band_deterministic_and_masks_nodata():
     assert [item["upper"] for item in metadata["bands"]] == [400.0, 4000.0, 40.0]
 
 
+def test_all_nodata_raster_window_has_a_distinct_failure_type():
+    """DECISION-005: a legal all-NoData window is distinguishable from corrupt RGB."""
+    from raster_preprocessing import EmptyRasterWindowError, normalise_raster_bands
+
+    bands = np.zeros((3, 16, 16), dtype=np.uint8)
+    masks = np.zeros_like(bands, dtype=np.uint8)
+
+    with pytest.raises(EmptyRasterWindowError, match="no valid pixels"):
+        normalise_raster_bands(bands, masks)
+
+
 def test_legacy_export_engine_is_fail_closed(tmp_path):
+    """DECISION-001: legacy exporters cannot bypass the formal export gate."""
     from export import ExportEngine
     from state import AppState
 
@@ -119,6 +133,7 @@ def test_legacy_export_engine_is_fail_closed(tmp_path):
 
 
 def test_cache_restore_rejects_old_mask_when_model_file_changes(tmp_path, monkeypatch):
+    """DECISION-002: cache restoration rejects evidence from a changed model."""
     import cache
     from config import Config
     from model import INFERENCE_PIPELINE_VERSION
@@ -175,6 +190,7 @@ def test_cache_restore_rejects_old_mask_when_model_file_changes(tmp_path, monkey
 
 
 def test_cache_loader_never_reuses_same_shape_mask_from_another_source(tmp_path, monkeypatch):
+    """DECISION-002: array shape alone never establishes cache identity."""
     import cache
 
     monkeypatch.setattr(cache, "CACHE_ROOT", str(tmp_path / "cache"))
@@ -188,6 +204,7 @@ def test_cache_loader_never_reuses_same_shape_mask_from_another_source(tmp_path,
 
 
 def test_metric_processing_rejects_anisotropic_raster_pixels():
+    """DECISION-003: unsupported anisotropic scale cannot enter metric processing."""
     from pyside6_app.workers import require_metric_scale
 
     class AnisotropicGeo:
@@ -208,6 +225,7 @@ def test_metric_processing_rejects_anisotropic_raster_pixels():
 
 
 def test_builtin_model_registry_matches_present_weight_files():
+    """DECISION-006: built-in model trust is pinned to verified file hashes."""
     import json
     from pathlib import Path
     from provenance import file_sha256
@@ -222,6 +240,7 @@ def test_builtin_model_registry_matches_present_weight_files():
 
 
 def test_provenance_canonical_json_normalises_nonfinite_metadata():
+    """DECISION-005: preprocessing provenance has stable canonical serialization."""
     from provenance import canonical_json_bytes
 
     encoded = canonical_json_bytes({"nodata": np.float32(np.nan)})
@@ -229,6 +248,7 @@ def test_provenance_canonical_json_normalises_nonfinite_metadata():
 
 
 def test_offline_manifest_checker_detects_route_tampering(tmp_path):
+    """DECISION-001: exported route tampering is detectable offline."""
     import json
     from integrity_check import verify_manifest
     from provenance import file_sha256, make_stage_record

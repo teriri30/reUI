@@ -79,6 +79,7 @@ def test_failed_rerun_cannot_mark_old_mask_as_new_success(monkeypatch, tmp_path)
 
 
 def test_failed_inference_tile_aborts_instead_of_becoming_background():
+    """DECISION-004: a missing tile is a failed inference, not valid background."""
     from model import TiledInference
 
     class FailingEngine:
@@ -131,6 +132,7 @@ def test_invalid_or_manually_edited_path_is_blocked_from_export():
 
 
 def test_metric_processing_requires_valid_georeference():
+    """DECISION-003: metric algorithms fail closed without reliable georeferencing."""
     from pyside6_app.workers import require_metric_scale
     from state import AppState
 
@@ -139,6 +141,7 @@ def test_metric_processing_requires_valid_georeference():
 
 
 def test_export_blocks_when_harvester_parameters_changed_after_planning():
+    """DECISION-007: changed machine constraints invalidate planned output."""
     from pyside6_app.main_window import MainWindow
 
     QApplication.instance() or QApplication([])
@@ -162,6 +165,7 @@ def test_export_blocks_when_harvester_parameters_changed_after_planning():
 
 
 def test_input_changes_invalidate_stale_downstream_results():
+    """DECISION-007: scientific input changes clear stale downstream evidence."""
     from pyside6_app.main_window import MainWindow
     from state import AutoPathSegment
 
@@ -260,6 +264,7 @@ def test_route_export_manifest_records_integrity_and_validation(tmp_path):
 
 
 def test_machine_parameter_output_is_explicitly_unvalidated_heuristic():
+    """DECISION-008: machine-size advice remains labelled as an unvalidated heuristic."""
     from pyside6_app.main_window import MainWindow
 
     QApplication.instance() or QApplication([])

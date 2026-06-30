@@ -18,6 +18,7 @@ def _resolve_recorded_path(recorded: str, manifest_path: Path) -> Path:
 
 
 def verify_manifest(manifest_file: os.PathLike | str, verify_sources: bool = False) -> list[str]:
+    """DECISION-001: independently verify a formal route and evidence chain."""
     manifest_path = Path(manifest_file).resolve()
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     errors = []

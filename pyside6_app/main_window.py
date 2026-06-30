@@ -949,6 +949,12 @@ class MainWindow(QMainWindow):
             self._on_load_model_at(dlg.selected_path)
 
     def _on_load_model_at(self, path):
+        """DECISION-006: load only explicitly trusted and content-identified weights.
+
+        Built-in weights are bound to the registry SHA-256. External PyTorch
+        weights require confirmation because a .pt file is executable
+        serialization, not an inert data asset. See docs/DECISIONS.md.
+        """
         if not path or not os.path.isfile(path):
             self.log_panel.error(f"模型文件不存在: {path}")
             return False
@@ -1193,7 +1199,12 @@ class MainWindow(QMainWindow):
         self.task_panel.apply_task_statuses(statuses)
 
     def _invalidate_analysis_from(self, stage, reason=""):
-        """Invalidate every result derived from a changed scientific input."""
+        """DECISION-007: invalidate every result derived from changed input.
+
+        The dependency order is inference -> mask -> path -> simulation/export.
+        Keeping a later artifact after an earlier input changes would make the
+        displayed route disagree with the data used to calculate it.
+        """
         stage = str(stage or "path")
         if stage not in {"inference", "mask", "path"}:
             raise ValueError(f"unknown invalidation stage: {stage}")
@@ -1285,6 +1296,7 @@ class MainWindow(QMainWindow):
             self.log_panel.info(f"掩膜处理强度: {labels.get(strength_key, strength_key)}")
 
     def _on_turn_strategy_changed(self, strategy_key):
+        """DECISION-007: a new turn strategy invalidates the planned route."""
         if strategy_key == getattr(self.state, 'turn_strategy', None):
             return
         self._save_system_undo("切换调头方式")
@@ -1617,6 +1629,7 @@ class MainWindow(QMainWindow):
         self.top_toolbar.set_action_active("ENTRY_EXIT", self.state.entry_exit_mode)
 
     def _place_entry_exit_point(self, x, y):
+        """DECISION-007: changed service points invalidate route geometry."""
         self._service_points_visible = True
         had_path = bool(getattr(self.state, "auto_path_planned", False))
         idx = self._entry_exit_click_idx
@@ -1962,6 +1975,13 @@ class MainWindow(QMainWindow):
         }
 
     def _geo_export_payload(self):
+        """DECISION-001: fail-closed gate for every formal geographic export.
+
+        GeoJSON, CSV, KML, JSON and $PATH must all pass this function. The
+        checks are intentionally redundant with stage validation because a
+        route may enter a field trial. No exporter may bypass this gate.
+        See docs/DECISIONS.md and the DECISION-001 invariant tests.
+        """
         if not self.geo.is_ready():
             raise ValueError("当前影像没有可用地理坐标，不能导出经纬度文件")
         if self._tif_path and self._tif_source_identity:
@@ -2101,6 +2121,11 @@ class MainWindow(QMainWindow):
         return value
 
     def _write_export_manifest(self, output_path, output_format, path_result, geo_points):
+        """DECISION-001: make a route inseparable from its audit evidence.
+
+        A manifest failure is an export failure; callers must not report a
+        route as complete without its source, model, code and stage hashes.
+        """
         from importlib import metadata
         from cache import source_identity
         from provenance import APP_VERSION, code_identity, git_is_dirty, git_revision
@@ -3185,6 +3210,7 @@ class MainWindow(QMainWindow):
         cv2.imwrite(path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
         self.log_panel.success(f"已保存图像: {path}")
     def _on_params_dialog(self):
+        """DECISION-007: changed machine footprint requires replanning."""
         dlg = HarvesterParamsDialog(self.cfg.section("harvester"), self)
         if dlg.exec() == QDialog.Accepted:
             p = dlg.get_params()

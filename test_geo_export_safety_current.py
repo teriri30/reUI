@@ -67,6 +67,7 @@ def test_path_format_preserves_turn_segment_status(tmp_path):
 
 
 def test_manual_route_edit_refreshes_path_but_blocks_unvalidated_export(monkeypatch):
+    """DECISION-001: manual edits must invalidate formal-export approval."""
     QApplication.instance() or QApplication([])
     window = MainWindow()
     window._tif_rgb = np.zeros((20, 20, 3), dtype=np.uint8)

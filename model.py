@@ -261,7 +261,12 @@ class InferenceRunner:
 
     def start_from_tif(self, tif_path: str, display_shape: Tuple[int, int],
                        field_boundary: Optional[List] = None, downsample: int = 1):
-        """从原始 GeoTIFF 裁剪田块推理，而不是用降采样 UI 预览图推理。"""
+        """DECISION-004: infer from source GeoTIFF pixels, never the UI preview.
+
+        The preview is a display artifact. Using it for formal inference would
+        discard narrow-row evidence and invalidate physical downstream results.
+        Oversized crops therefore stream source-resolution tiles.
+        """
         if self.state.inference_running:
             return
         self.state.safe_update(
@@ -279,6 +284,128 @@ class InferenceRunner:
             daemon=True,
         )
         self._thread.start()
+
+    def _run_source_tif_tiles(self, src, x0_src: int, y0_src: int, crop_w: int, crop_h: int,
+                              out_w: int, out_h: int) -> Tuple[np.ndarray, dict]:
+        """DECISION-004: stream native source tiles without whole-crop scaling.
+
+        The configured crop limit selects the memory strategy, not a lower
+        scientific resolution. A failed tile fails the complete inference.
+        """
+        from rasterio.windows import Window
+        from raster_preprocessing import EmptyRasterWindowError, read_rgb_raster
+
+        capture_sz = int(self.cfg.TILE_CAPTURE_SIZE)
+        overlap = min(max(float(self.cfg.TILE_OVERLAP), 0.0), 0.95)
+        stride = max(1, int(round(capture_sz * (1.0 - overlap))))
+        n_cols = max(1, math.ceil((crop_w - capture_sz) / stride) + 1)
+        n_rows = max(1, math.ceil((crop_h - capture_sz) / stride) + 1)
+        total = n_rows * n_cols
+        out_mask = np.zeros((out_h, out_w), dtype=np.uint8)
+        preprocessing = {
+            "streamed_source_tiles": True,
+            "tile_capture_size": int(capture_sz),
+            "tile_overlap": float(overlap),
+            "tile_count": int(total),
+            "tile_preprocessing": [],
+        }
+        processed = 0
+        valid_tile_count = 0
+        skipped_nodata_count = 0
+        batch_images = []
+        batch_meta = []
+
+        def flush_batch():
+            nonlocal processed, batch_images, batch_meta
+            if not batch_images:
+                return
+            results = self.engine.predict(batch_images, conf=float(self.cfg.MODEL_CONF), iou=float(self.cfg.MODEL_IOU))
+            if results is None:
+                results = []
+                for image, meta in zip(batch_images, batch_meta):
+                    single = self.engine.predict(image, conf=float(self.cfg.MODEL_CONF), iou=float(self.cfg.MODEL_IOU))
+                    if not single:
+                        raise RuntimeError(f"tile inference failed at source window ({meta[0]}, {meta[1]})")
+                    results.append(single[0])
+            results = list(results)
+            if len(results) != len(batch_meta):
+                raise RuntimeError("tile inference failed: model result count does not match input tiles")
+            for result, (sx0, sy0, sw, sh) in zip(results, batch_meta):
+                if result is None:
+                    raise RuntimeError(f"tile inference failed at source window ({sx0}, {sy0})")
+                tile_mask = np.zeros((capture_sz, capture_sz), dtype=np.uint8)
+                if result.masks is not None:
+                    md = result.masks.data.cpu().numpy()
+                    if len(md) > 0:
+                        probability = np.max(md, axis=0)
+                        if probability.shape[:2] != (capture_sz, capture_sz):
+                            probability = cv2.resize(probability, (capture_sz, capture_sz), interpolation=cv2.INTER_LINEAR)
+                        prob_u8 = (np.clip(probability, 0, 1) * 255).astype(np.uint8)
+                        _, tile_mask = cv2.threshold(prob_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                dx0 = int(math.floor((sx0 / max(1, crop_w)) * out_w))
+                dy0 = int(math.floor((sy0 / max(1, crop_h)) * out_h))
+                dx1 = int(math.ceil(((sx0 + sw) / max(1, crop_w)) * out_w))
+                dy1 = int(math.ceil(((sy0 + sh) / max(1, crop_h)) * out_h))
+                dx0, dy0 = max(0, dx0), max(0, dy0)
+                dx1, dy1 = min(out_w, dx1), min(out_h, dy1)
+                if dx1 > dx0 and dy1 > dy0:
+                    projected = cv2.resize(tile_mask[:sh, :sw], (dx1 - dx0, dy1 - dy0), interpolation=cv2.INTER_NEAREST)
+                    np.maximum(out_mask[dy0:dy1, dx0:dx1], projected, out=out_mask[dy0:dy1, dx0:dx1])
+                processed += 1
+            self.state.safe_update(
+                inference_progress=0.04 + (processed / max(1, total)) * 0.84,
+                status_message=f"原始影像流式切片推理中... {int(processed / max(1, total) * 100)}%",
+            )
+            batch_images = []
+            batch_meta = []
+
+        self.log.info(
+            f"原始分辨率流式切片推理: {n_rows}x{n_cols}={total}块, "
+            f"tile={capture_sz}px, overlap={overlap * 100:.0f}%"
+        )
+        for row in range(n_rows):
+            for col in range(n_cols):
+                sx0 = min(col * stride, crop_w - capture_sz)
+                sy0 = min(row * stride, crop_h - capture_sz)
+                sx0, sy0 = max(0, sx0), max(0, sy0)
+                sw = min(capture_sz, crop_w - sx0)
+                sh = min(capture_sz, crop_h - sy0)
+                try:
+                    tile_img, tile_pre = read_rgb_raster(
+                        src,
+                        window=Window(x0_src + sx0, y0_src + sy0, sw, sh),
+                        config=self.cfg.section("raster_preprocessing"),
+                    )
+                except EmptyRasterWindowError:
+                    skipped_nodata_count += 1
+                    processed += 1
+                    continue
+                valid_tile_count += 1
+                if len(preprocessing["tile_preprocessing"]) < 3:
+                    preprocessing["tile_preprocessing"].append(tile_pre)
+                if tile_img.shape[0] < capture_sz or tile_img.shape[1] < capture_sz:
+                    tile_img = cv2.copyMakeBorder(
+                        tile_img,
+                        0,
+                        capture_sz - tile_img.shape[0],
+                        0,
+                        capture_sz - tile_img.shape[1],
+                        cv2.BORDER_REFLECT,
+                    )
+                batch_images.append(cv2.cvtColor(tile_img, cv2.COLOR_BGR2RGB))
+                batch_meta.append((sx0, sy0, sw, sh))
+                if len(batch_images) >= 4:
+                    flush_batch()
+        flush_batch()
+        preprocessing["valid_tile_count"] = int(valid_tile_count)
+        preprocessing["skipped_nodata_tile_count"] = int(skipped_nodata_count)
+        if valid_tile_count == 0:
+            raise RuntimeError("selected source crop contains no valid RGB pixels")
+        if skipped_nodata_count:
+            self.log.info(
+                f"source-tile inference skipped {skipped_nodata_count}/{total} all-NoData tiles"
+            )
+        return out_mask, preprocessing
 
     def _run_from_tif(self, tif_path: str, display_shape: Tuple[int, int],
                       field_boundary: Optional[List] = None, downsample: int = 1):
@@ -315,6 +442,8 @@ class InferenceRunner:
                 if x1_src <= x0_src or y1_src <= y0_src:
                     self.state.safe_update(status_message="推理失败：田块范围无效", inference_running=False)
                     return
+                out_w = max(1, x1_d - x0_d)
+                out_h = max(1, y1_d - y0_d)
                 crop_w = int(x1_src - x0_src)
                 crop_h = int(y1_src - y0_src)
                 crop_pixels = crop_w * crop_h
@@ -325,50 +454,62 @@ class InferenceRunner:
                     )
                 )
                 if max_crop_pixels > 0 and crop_pixels > max_crop_pixels:
-                    message = (
-                        f"推理失败：圈选区域过大 ({crop_w}x{crop_h}, "
-                        f"{crop_pixels / 1_000_000:.1f}MP)，"
-                        f"超过上限 {max_crop_pixels / 1_000_000:.1f}MP。"
-                        "请缩小田块范围，或在 config.json 中调高 max_source_crop_pixels。"
+                    self.log.warning(
+                        f"原始裁剪区域过大 ({crop_w}x{crop_h}, {crop_pixels / 1_000_000:.1f}MP)，"
+                        "改用原始分辨率流式切片推理，避免整体下采样导致掩膜变粗"
                     )
-                    self.log.warning(message)
                     self.state.safe_update(
-                        status_message=message,
-                        inference_running=False,
+                        status_message=(
+                            "圈选区域原始分辨率较大，正在按 640px 原始切片流式推理..."
+                        )
                     )
-                    return
-                crop_img, preprocessing = read_rgb_raster(
-                    src,
-                    window=Window(x0_src, y0_src, x1_src - x0_src, y1_src - y0_src),
-                    config=self.cfg.section("raster_preprocessing"),
-                )
+                    crop_mask_src, preprocessing = self._run_source_tif_tiles(
+                        src,
+                        x0_src,
+                        y0_src,
+                        crop_w,
+                        crop_h,
+                        out_w,
+                        out_h,
+                    )
+                    crop_img_shape = crop_mask_src.shape
+                    local_mask_pts = pts_display.copy()
+                    local_mask_pts[:, 0] -= x0_d
+                    local_mask_pts[:, 1] -= y0_d
+                else:
+                    crop_img, preprocessing = read_rgb_raster(
+                        src,
+                        window=Window(x0_src, y0_src, x1_src - x0_src, y1_src - y0_src),
+                        config=self.cfg.section("raster_preprocessing"),
+                    )
+                    crop_img_shape = crop_img.shape[:2]
+                    local_mask_pts = pts_source.copy()
+                    local_mask_pts[:, 0] -= x0_src
+                    local_mask_pts[:, 1] -= y0_src
 
-            local_src = pts_source.copy()
-            local_src[:, 0] -= x0_src
-            local_src[:, 1] -= y0_src
-            crop_field_mask = np.zeros(crop_img.shape[:2], dtype=np.uint8)
-            cv2.fillPoly(crop_field_mask, [local_src], 255)
+            crop_field_mask = np.zeros(crop_img_shape, dtype=np.uint8)
+            cv2.fillPoly(crop_field_mask, [np.rint(local_mask_pts).astype(np.int32)], 255)
             self.log.info(
-                f"原始分辨率田块裁剪尺寸: {crop_img.shape[1]}x{crop_img.shape[0]}, "
+                f"原始分辨率田块裁剪尺寸: {crop_img_shape[1]}x{crop_img_shape[0]}, "
                 f"display_scale=({scale_x:.9f},{scale_y:.9f})"
             )
+            if crop_pixels <= max_crop_pixels or max_crop_pixels <= 0:
+                def progress_cb(pct: float):
+                    self.state.safe_update(
+                        inference_progress=0.04 + pct * 0.84,
+                        status_message=f"原始影像切片推理中... {int(pct * 100)}%",
+                    )
 
-            def progress_cb(pct: float):
-                self.state.safe_update(
-                    inference_progress=0.04 + pct * 0.84,
-                    status_message=f"原始影像切片推理中... {int(pct * 100)}%",
+                crop_mask_src = TiledInference(self.engine).run(
+                    crop_img,
+                    progress_cb=progress_cb,
+                    capture_sz=int(self.cfg.TILE_CAPTURE_SIZE),
+                    overlap=float(self.cfg.TILE_OVERLAP),
+                    erode=False,
+                    conf=float(self.cfg.MODEL_CONF),
+                    iou=float(self.cfg.MODEL_IOU),
+                    batch_size=4,
                 )
-
-            crop_mask_src = TiledInference(self.engine).run(
-                crop_img,
-                progress_cb=progress_cb,
-                capture_sz=int(self.cfg.TILE_CAPTURE_SIZE),
-                overlap=float(self.cfg.TILE_OVERLAP),
-                erode=False,
-                conf=float(self.cfg.MODEL_CONF),
-                iou=float(self.cfg.MODEL_IOU),
-                batch_size=4,
-            )
             if crop_mask_src is not None:
                 self.state.safe_update(inference_progress=0.92, status_message="正在裁剪田块范围...")
                 clipped = cv2.bitwise_and(crop_mask_src, crop_mask_src, mask=crop_field_mask)
@@ -378,9 +519,10 @@ class InferenceRunner:
                 self.state.safe_update(status_message="推理失败：掩膜为空", inference_running=False)
                 return
 
-            out_w = max(1, x1_d - x0_d)
-            out_h = max(1, y1_d - y0_d)
-            mask = cv2.resize(crop_mask_src, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+            if crop_mask_src.shape[:2] == (out_h, out_w):
+                mask = crop_mask_src
+            else:
+                mask = cv2.resize(crop_mask_src, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
             boundary_meta = [[float(px), float(py)] for px, py in (self.state.field_boundary or [])]
             from provenance import file_sha256, make_stage_record
             source_sha256 = str(getattr(self.state, "source_sha256", "") or "")

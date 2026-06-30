@@ -372,7 +372,7 @@ def wait_for_project_state_saves(tif_path: str = "", timeout: float = 10.0) -> b
 
 
 def load_project_state(tif_path: str, expected_source_sha256: str = "") -> Dict[str, Any]:
-    """Load a full project snapshot. Invalid/old snapshots fail closed."""
+    """DECISION-002: load a snapshot only when its exact source still matches."""
     path = _project_state_path(tif_path)
     if not os.path.exists(path):
         return {}
